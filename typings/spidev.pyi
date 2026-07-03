@@ -1,0 +1,9 @@
+from typing import Sequence
+
+class SpiDev:
+    max_speed_hz: int
+    mode: int
+
+    def open(self, bus: int, device: int) -> None: ...
+    def writebytes(self, data: Sequence[int]) -> None: ...
+    def writebytes2(self, data: Sequence[int] | bytes | bytearray) -> None: ...

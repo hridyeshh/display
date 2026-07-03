@@ -1,0 +1,7 @@
+numpy
+Pillow
+requests
+spidev
+lgpio
+icalendar
+recurring-ical-events

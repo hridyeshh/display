@@ -1,0 +1,94 @@
+<!-- @dsCard group="Widgets" viewport="240x320" name="Clock" subtitle="Big-numeral time, day & seconds bar" -->
+<!-- @startingPoint section="Widgets" subtitle="Big-numeral time, day & seconds bar" viewport="240x320" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=240, height=320">
+<title>Desky · Clock</title>
+<link rel="stylesheet" href="styles.css">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%; background: #000;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+    -webkit-font-smoothing: none;
+    image-rendering: pixelated;
+  }
+  .screen {
+    width: 240px; height: 320px; background: var(--bg); color: var(--fg);
+    overflow: hidden; display: flex; flex-direction: column; padding: 18px;
+    font-family: var(--font-body);
+  }
+
+  /* top row */
+  .top { display: flex; justify-content: space-between; align-items: flex-start; }
+  .zone { font-size: 7px; color: var(--fg-muted); line-height: 1.8; }
+  .secs { font-size: 7px; color: var(--accent-warm); line-height: 1.8; text-align: right; }
+
+  /* hero time */
+  .hero { flex: 1; display: flex; flex-direction: column;
+          align-items: center; justify-content: center; gap: 16px; }
+  .time {
+    font-family: var(--font-display);
+    font-size: 80px; line-height: 1;
+    color: var(--fg); display: flex; align-items: baseline;
+    font-variant-numeric: tabular-nums;
+  }
+  .colon {
+    color: var(--accent-warm);
+    animation: blink 1s step-start infinite;
+  }
+  @keyframes blink { 0%,40%,60%,100%{opacity:1} 50%{opacity:0} }
+
+  /* day + date on two separate lines, centered */
+  .date { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+  .date .day { font-size: 7px; color: var(--fg); letter-spacing: 0.05em; }
+  .date .dmy { font-size: 7px; color: var(--accent-warm); letter-spacing: 0.05em; }
+
+  /* seconds bar */
+  .secbar { height: 4px; background: var(--line); position: relative; }
+  .secbar .fill { position: absolute; left:0; top:0; bottom:0; background: var(--accent-warm); }
+</style>
+</head>
+<body>
+  <div class="screen" data-screen-label="clock">
+    <div class="top">
+      <span class="zone">IST<br>BENGALURU</span>
+      <span class="secs" id="secs">00&Prime;</span>
+    </div>
+    <div class="hero">
+      <div class="time" id="time">
+        <span id="hh">14</span><span class="colon">:</span><span id="mm">32</span>
+      </div>
+      <div class="date">
+        <span class="day" id="day">SATURDAY</span>
+        <span class="dmy" id="dmy">06 JUN</span>
+      </div>
+    </div>
+    <div class="secbar"><div class="fill" id="fill"></div></div>
+  </div>
+
+<script>
+  const DAYS = ['SUNDAY','MONDAY','TUESDAY','WEDNESDAY','THURSDAY','FRIDAY','SATURDAY'];
+  const MON  = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  function istNow() {
+    const n = new Date();
+    return new Date(n.getTime() + (n.getTimezoneOffset() + 330) * 60000);
+  }
+  function pad(n){ return String(n).padStart(2,'0'); }
+  function tick() {
+    const d = istNow();
+    const ss = d.getSeconds();
+    document.getElementById('hh').textContent = pad(d.getHours());
+    document.getElementById('mm').textContent = pad(d.getMinutes());
+    document.getElementById('secs').innerHTML = pad(ss) + '&Prime;';
+    document.getElementById('day').textContent = DAYS[d.getDay()];
+    document.getElementById('dmy').textContent = pad(d.getDate()) + ' ' + MON[d.getMonth()];
+    document.getElementById('fill').style.width = (ss / 60 * 100) + '%';
+  }
+  tick(); setInterval(tick, 1000);
+</script>
+</body>
+</html>
