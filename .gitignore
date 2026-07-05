@@ -1,0 +1,12 @@
+# OS / editor cruft
+.DS_Store
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Runtime output / local media
+media/
+out_*.png

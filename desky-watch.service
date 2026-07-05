@@ -1,0 +1,14 @@
+[Unit]
+Description=Desky auto-deploy watcher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/home/hridyesh/display/watch-deploy.sh
+WorkingDirectory=/home/hridyesh/display
+Restart=always
+RestartSec=10
+User=hridyesh
+
+[Install]
+WantedBy=multi-user.target

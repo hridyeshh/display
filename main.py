@@ -8,6 +8,7 @@ import math
 import json
 import threading
 import socket
+import random
 import numpy as np
 import spidev
 import lgpio
@@ -18,6 +19,8 @@ W, H = 240, 320
 BACKEND = "https://web-production-12607.up.railway.app"
 POLL_SEC = 5
 HEARTBEAT_SEC = 5
+MUSIC_IDLE_FALLBACK_SECONDS = 120  # music idle this long -> render a fallback widget
+FALLBACK_WIDGETS = ["quote", "pet"]
 
 BACKLIGHT_PIN = None
 SPI_LOCK = threading.Lock()
@@ -30,6 +33,8 @@ import widgets.gif as widget_gif
 import widgets.offline as widget_offline
 import widgets.timer as widget_timer
 import widgets.calendar as widget_calendar
+import widgets.quote as widget_quote
+import widgets.pet as widget_pet
 
 WIDGETS = {
     "clock":   widget_clock.render,
@@ -38,6 +43,8 @@ WIDGETS = {
     "tasks":   widget_tasks.render,
     "gif":     widget_gif.render,
     "offline": widget_offline.render,
+    "quote":   widget_quote.render,
+    "pet":     widget_pet.render,
 }
 
 _IS_ONLINE = True
@@ -49,6 +56,12 @@ BANNER_SEC = 10
 
 UPCOMING_EVENTS = []
 _FIRED = set()
+
+# Auto-fallback: when a "music" screen sits idle past MUSIC_IDLE_FALLBACK_SECONDS,
+# render a fallback widget instead (the /config value stays "music"). The
+# fallback is chosen once per idle transition so it doesn't flicker every render.
+_music_last_playing = {}  # screen key -> last time status was "playing"
+_music_fallback = {}      # screen key -> chosen fallback widget name, or None
 
 CONFIG = {"screen1": "clock", "screen2": "music", "screen3": "weather"}
 
@@ -365,6 +378,29 @@ def screen_loop(panel, key):
                 panel.show(img)
             except Exception: pass
             time.sleep(0.25)
+            continue
+
+        if name == "music":
+            data = widget_music._fetch_spotify() or {}
+            status = data.get("status", "idle")
+            if status == "playing":
+                _music_last_playing[key] = now
+                _music_fallback[key] = None
+                render_name = "music"
+            else:
+                _music_last_playing.setdefault(key, now)  # seed so brief pauses don't fall back
+                if now - _music_last_playing[key] > MUSIC_IDLE_FALLBACK_SECONDS:
+                    if _music_fallback.get(key) is None:
+                        _music_fallback[key] = random.choice(FALLBACK_WIDGETS)  # pick once per transition
+                    render_name = _music_fallback[key]
+                else:
+                    render_name = "music"
+            try:
+                img = render_named(render_name, key)
+                img = apply_encoder_modifications(img, screen_num)
+                panel.show(img)
+            except Exception: time.sleep(1.0)
+            time.sleep(1.0)
             continue
 
         try:
