@@ -19,8 +19,6 @@ W, H = 240, 320
 BACKEND = "https://web-production-12607.up.railway.app"
 POLL_SEC = 5
 HEARTBEAT_SEC = 5
-MUSIC_IDLE_FALLBACK_SECONDS = 120  # music idle this long -> render a fallback widget
-FALLBACK_WIDGETS = ["quote", "pet"]
 
 BACKLIGHT_PIN = None
 SPI_LOCK = threading.Lock()
@@ -53,15 +51,10 @@ _KEY_NUM = {"screen1": 1, "screen2": 2, "screen3": 3}
 CAL_SCREEN = "screen1"
 CAL_MILESTONES = (30, 15)
 BANNER_SEC = 10
+MUSIC_IDLE_FALLBACK_SECONDS = 120  # 2 minutes of silence before fallback triggers
 
 UPCOMING_EVENTS = []
 _FIRED = set()
-
-# Auto-fallback: when a "music" screen sits idle past MUSIC_IDLE_FALLBACK_SECONDS,
-# render a fallback widget instead (the /config value stays "music"). The
-# fallback is chosen once per idle transition so it doesn't flicker every render.
-_music_last_playing = {}  # screen key -> last time status was "playing"
-_music_fallback = {}      # screen key -> chosen fallback widget name, or None
 
 CONFIG = {"screen1": "clock", "screen2": "music", "screen3": "weather"}
 
@@ -73,7 +66,7 @@ def _claim_output(pin, level):
     assert GPIO is not None, "GPIO handle must be initialized"
     try:
         if pin not in _CLAIMED:
-            lgpio.gpio_claimutput(GPIO, pin, level)
+            lgpio.gpio_claim_output(GPIO, pin, level)
             _CLAIMED.add(pin)
         else:
             lgpio.gpio_write(GPIO, pin, level)
@@ -88,13 +81,13 @@ def render_placeholder(name):
         f_sub = ImageFont.truetype("/home/hridyesh/display/fonts/PressStart2P-Regular.ttf", 8)
     except OSError:
         f_lbl = f_sub = ImageFont.load_default()
-
+        
     d.rectangle([14, 14, W - 14, H - 14], outline=(34, 34, 34), width=2)
-
+    
     t = time.time() * 4
     pulse = int(140 + 115 * math.sin(t))
     pulse = max(40, min(255, pulse))
-
+    
     d.text((W // 2, H // 2 - 15), "INITIALIZING...", font=f_lbl, fill=(pulse, pulse, pulse), anchor="mm")
     d.text((W // 2, H // 2 + 15), f"WIDGET: {str(name).upper()}", font=f_sub, fill=(252, 60, 68), anchor="mm")
     return img
@@ -164,13 +157,12 @@ class DisplayPanel:
         self.cmd(0xC1); self.dat([0x10])
         self.cmd(0xC5); self.dat([0x3E, 0x28])
         self.cmd(0xC7); self.dat([0x86])
-
-        # Orientations & Colors mapped properly
+        
         if self.flip_180:
-            self.cmd(0x36); self.dat([0xE0])
+            self.cmd(0x36); self.dat([0xE0])  
         else:
-            self.cmd(0x36); self.dat([0x20])
-
+            self.cmd(0x36); self.dat([0x20])  
+        
         self.cmd(0x3A); self.dat([0x55])
         self.cmd(0xB1); self.dat([0x00, 0x18])
         self.cmd(0xB6); self.dat([0x08, 0x82, 0x27])
@@ -221,8 +213,8 @@ def fetch_config_loop():
                 if resp.status_code != 200: raise RuntimeError(f"status {resp.status_code}")
                 fails = 0
                 for raw in resp.iter_lines(decode_unicode=True):
-                    if not raw: continue
-                    if raw.startswith(":"): continue
+                    if not raw: continue          
+                    if raw.startswith(":"): continue          
                     if raw.startswith("data:"): _apply_event_data(raw[len("data:"):])
         except Exception as e:
             fails += 1
@@ -316,7 +308,7 @@ def screen_loop(panel, key):
     is_cal_screen = (key == CAL_SCREEN)
     banner_until = 0.0
     banner_payload = None
-    _last_end = 0.0
+    _last_end = 0.0      
     _timer_start = 0.0
     screen_num = _KEY_NUM.get(key, 1)
 
@@ -346,6 +338,8 @@ def screen_loop(panel, key):
             continue
 
         now = time.time()
+        
+        # --- CALENDAR BANNER LOGIC ---
         if is_cal_screen:
             trig = _calendar_trigger(now)
             if trig:
@@ -358,6 +352,21 @@ def screen_loop(panel, key):
                 continue
 
         name = CONFIG.get(key, "")
+
+        # --- NEW: STATE CHANGE DETECTOR ---
+        # If the backend changed the widget (e.g. Timer -> Music), wipe the fallback variables clean
+        if not hasattr(panel, "current_config"):
+            panel.current_config = name
+            panel.last_playing = now
+            panel.in_fallback = False
+            panel.fallback_widget = "quote"
+            
+        if panel.current_config != name:
+            panel.current_config = name
+            panel.last_playing = now
+            panel.in_fallback = False
+        
+        # --- TIMER LOGIC ---
         if name == "timer":
             n = screen_num
             try: end = float(CONFIG.get(f"timer_end_{n}", 0) or 0)
@@ -380,28 +389,21 @@ def screen_loop(panel, key):
             time.sleep(0.25)
             continue
 
+        # --- MUSIC AUTO-FALLBACK LOGIC ---
         if name == "music":
-            data = widget_music._fetch_spotify() or {}
-            status = data.get("status", "idle")
+            music_data = widget_music._fetch_spotify() or {}
+            status = music_data.get("status", "not_configured")
+
             if status == "playing":
-                _music_last_playing[key] = now
-                _music_fallback[key] = None
-                render_name = "music"
+                panel.last_playing = now
+                panel.in_fallback = False
+            elif (now - panel.last_playing) > MUSIC_IDLE_FALLBACK_SECONDS:
+                if not panel.in_fallback:
+                    panel.fallback_widget = random.choice(["quote", "pet"])
+                    panel.in_fallback = True
+                name = panel.fallback_widget
             else:
-                _music_last_playing.setdefault(key, now)  # seed so brief pauses don't fall back
-                if now - _music_last_playing[key] > MUSIC_IDLE_FALLBACK_SECONDS:
-                    if _music_fallback.get(key) is None:
-                        _music_fallback[key] = random.choice(FALLBACK_WIDGETS)  # pick once per transition
-                    render_name = _music_fallback[key]
-                else:
-                    render_name = "music"
-            try:
-                img = render_named(render_name, key)
-                img = apply_encoder_modifications(img, screen_num)
-                panel.show(img)
-            except Exception: time.sleep(1.0)
-            time.sleep(1.0)
-            continue
+                panel.in_fallback = False
 
         try:
             img = render_named(name, key)
@@ -419,21 +421,21 @@ def apply_encoder_modifications(img, screen_num):
         with open(focus_file, "r") as f: focused_target = int(f.read().strip())
         if time.time() - os.path.getmtime(focus_file) > 2.5: focused_target = 0
     except Exception: pass
-
+    
     brightness_val = 100
     try:
         with open(f"/dev/shm/desky_bright_s{screen_num}", "r") as f: brightness_val = int(f.read().strip())
     except Exception: pass
-
+    
     if brightness_val < 100:
         factor = max(0.1, brightness_val / 100.0)
         img = Image.eval(img, lambda pixel: int(pixel * factor))
-
+        
     if focused_target == screen_num:
         d = ImageDraw.Draw(img)
         d.rectangle([0, 0, W - 1, H - 1], outline=(252, 60, 68), width=3)
     return img
-
+    
 def main():
     global GPIO
     GPIO = lgpio.gpiochip_open(0)
@@ -451,7 +453,7 @@ def main():
         ("screen2", DisplayPanel(port=0, device=1, dc=24, rst=None, speed=16000000, flip_180=True)),
         ("screen3", DisplayPanel(port=1, device=0, dc=22, rst=23, speed=8000000, flip_180=True)),
     ]
-
+    
     set_backlight(True)
     threads = [
         threading.Thread(target=fetch_config_loop, daemon=True),
@@ -461,7 +463,7 @@ def main():
     ]
     for key, panel in panels: threads.append(threading.Thread(target=screen_loop, args=(panel, key), daemon=True))
     for t in threads: t.start()
-
+    
     try:
         while True: time.sleep(1)
     except KeyboardInterrupt: pass
