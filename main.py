@@ -51,7 +51,7 @@ _KEY_NUM = {"screen1": 1, "screen2": 2, "screen3": 3}
 CAL_SCREEN = "screen1"
 CAL_MILESTONES = (30, 15)
 BANNER_SEC = 10
-MUSIC_IDLE_FALLBACK_SECONDS = 120  # 2 minutes of silence before fallback triggers
+MUSIC_IDLE_FALLBACK_SECONDS = 30  # 30 seconds of silence before fallback triggers
 
 UPCOMING_EVENTS = []
 _FIRED = set()
