@@ -22,16 +22,16 @@ def write_bright(screen, val):
             f.write(str(val))
     except Exception: pass
 
-# Initialize shared memory files
+# Initialize shared memory files in RAM
 write_focus()
 for s in [1, 2, 3]:
     write_bright(s, bright[s])
 
 h = lgpio.gpiochip_open(0)
-# Internal pull-ups: bare/KY-040 encoders leave the SW (button) pin floating,
-# so without a pull-up the button never fires a clean falling edge.
-lgpio.gpio_claim_alert(h, PIN_A, lgpio.EITHER_EDGE, lgpio.SET_PULL_UP)
-lgpio.gpio_claim_alert(h, PIN_B, lgpio.EITHER_EDGE, lgpio.SET_PULL_UP)
+
+# Configure hardware pull-ups and alerts using correct lgpio constants
+lgpio.gpio_claim_alert(h, PIN_A, lgpio.BOTH_EDGES, lgpio.SET_PULL_UP)
+lgpio.gpio_claim_alert(h, PIN_B, lgpio.BOTH_EDGES, lgpio.SET_PULL_UP)
 lgpio.gpio_claim_alert(h, PIN_BTN, lgpio.FALLING_EDGE, lgpio.SET_PULL_UP)
 
 last_a = lgpio.gpio_read(h, PIN_A)
@@ -40,7 +40,7 @@ last_btn_ns = 0
 def cbf(chip, gpio, level, timestamp):
     global current_screen, last_a, last_btn_ns
 
-    # Handle Button Clicks (debounce ~250ms; timestamp is nanoseconds)
+    # Handle Button Clicks (debounce ~250ms; timestamp is in nanoseconds)
     if gpio == PIN_BTN and level == 0:
         if timestamp - last_btn_ns < 250_000_000:
             return
@@ -64,7 +64,8 @@ def cbf(chip, gpio, level, timestamp):
             write_focus()
         last_a = a
 
-cb_a = lgpio.callback(h, PIN_A, lgpio.EITHER_EDGE, cbf)
+# Register callbacks
+cb_a = lgpio.callback(h, PIN_A, lgpio.BOTH_EDGES, cbf)
 cb_btn = lgpio.callback(h, PIN_BTN, lgpio.FALLING_EDGE, cbf)
 
 try:
