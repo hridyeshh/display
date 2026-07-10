@@ -22,6 +22,7 @@ def write_bright(screen, val):
             f.write(str(val))
     except Exception: pass
 
+
 # Initialize shared memory files in RAM
 write_focus()
 for s in [1, 2, 3]:
