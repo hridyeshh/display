@@ -21,6 +21,8 @@ POLL_SEC = 5
 HEARTBEAT_SEC = 5
 
 BACKLIGHT_PIN = None
+BRIGHTNESS_PIN = 17
+_current_brightness = 100
 SPI_LOCK = threading.Lock()
 
 import widgets.clock as widget_clock
@@ -195,13 +197,19 @@ _GIF_KEY = {"screen1": "gif_url_1", "screen2": "gif_url_2", "screen3": "gif_url_
 def _apply_event_data(payload):
     payload = payload.strip()
     if not payload: return
-    try: CONFIG.update(json.loads(payload))
+    try:
+        data = json.loads(payload)
+        CONFIG.update(data)
+        if "brightness" in data: set_brightness(data["brightness"])
     except Exception: pass
 
 def _poll_config_once():
     try:
         r = requests.get(BACKEND.rstrip("/") + "/config", timeout=4)
-        if r.status_code == 200: CONFIG.update(r.json())
+        if r.status_code == 200:
+            data = r.json()
+            CONFIG.update(data)
+            if "brightness" in data: set_brightness(data["brightness"])
     except Exception: pass
 
 def fetch_config_loop():
@@ -248,6 +256,14 @@ def set_backlight(on):
     if BACKLIGHT_PIN is None: return
     try: _claim_output(BACKLIGHT_PIN, 1 if on else 0)
     except Exception as e: pass
+
+def set_brightness(pct):
+    global _current_brightness
+    pct = max(10, min(100, int(pct)))
+    if pct == _current_brightness: return
+    _current_brightness = pct
+    try: lgpio.tx_pwm(GPIO, BRIGHTNESS_PIN, 1000, pct)
+    except Exception as e: print(f"[brightness] PWM error: {e}")
 
 def render_named(name, key):
     if name == "gif":
@@ -447,6 +463,10 @@ def main():
         for pin in (25, 23): lgpio.gpio_write(GPIO, pin, 1)
         time.sleep(0.1)
     except: pass
+
+    # Start backlight PWM at full brightness
+    try: lgpio.tx_pwm(GPIO, BRIGHTNESS_PIN, 1000, 100)
+    except Exception as e: print(f"[brightness] init error: {e}")
 
     panels = [
         ("screen1", DisplayPanel(port=0, device=0, dc=24, rst=25, speed=16000000, flip_180=True)),
