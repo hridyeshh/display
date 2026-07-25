@@ -1,0 +1,15 @@
+[Unit]
+Description=Desky display driver
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/home/hridyesh/display/.venv/bin/python /home/hridyesh/display/main.py
+WorkingDirectory=/home/hridyesh/display
+Restart=always
+RestartSec=5
+User=hridyesh
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
