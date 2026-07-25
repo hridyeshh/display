@@ -201,7 +201,8 @@ def _apply_event_data(payload):
         data = json.loads(payload)
         CONFIG.update(data)
         if "brightness" in data: set_brightness(data["brightness"])
-    except Exception: pass
+    except Exception as e:
+        print(f"[sse] error applying event: {e}")
 
 def _poll_config_once():
     try:
@@ -261,9 +262,13 @@ def set_brightness(pct):
     global _current_brightness
     pct = max(10, min(100, int(pct)))
     if pct == _current_brightness: return
+    print(f"[brightness] {_current_brightness} -> {pct}")
     _current_brightness = pct
-    try: lgpio.tx_pwm(GPIO, BRIGHTNESS_PIN, 1000, pct)
-    except Exception as e: print(f"[brightness] PWM error: {e}")
+    try:
+        lgpio.tx_pwm(GPIO, BRIGHTNESS_PIN, 1000, pct)
+        print(f"[brightness] PWM set OK: pin={BRIGHTNESS_PIN} freq=1000 duty={pct}")
+    except Exception as e:
+        print(f"[brightness] PWM error: {e}")
 
 def render_named(name, key):
     if name == "gif":
