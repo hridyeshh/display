@@ -35,6 +35,7 @@ import widgets.timer as widget_timer
 import widgets.calendar as widget_calendar
 import widgets.quote as widget_quote
 import widgets.pet as widget_pet
+import widgets.byte as widget_byte
 
 WIDGETS = {
     "clock":   widget_clock.render,
@@ -51,6 +52,10 @@ _IS_ONLINE = True
 _KEY_NUM = {"screen1": 1, "screen2": 2, "screen3": 3}
 
 CAL_SCREEN = "screen1"
+# Which physical screen "Byte" takes over during a voice interaction. Byte has
+# no CONFIG slot: this screen keeps rendering its configured widget and Byte
+# only borrows it while voice_state is anything other than 'idle'.
+VOICE_SCREEN = "screen2"
 CAL_MILESTONES = (30, 15)
 BANNER_SEC = 10
 MUSIC_IDLE_FALLBACK_SECONDS = 30  # 30 seconds of silence before fallback triggers
@@ -327,6 +332,9 @@ def calendar_loop():
 def screen_loop(panel, key):
     sleeping = False
     is_cal_screen = (key == CAL_SCREEN)
+    is_voice_screen = (key == VOICE_SCREEN)
+    voice_prev = "idle"
+    voice_since = 0.0
     banner_until = 0.0
     banner_payload = None
     _last_end = 0.0      
@@ -371,6 +379,30 @@ def screen_loop(panel, key):
                 except Exception: pass
                 time.sleep(0.3)
                 continue
+
+        # --- VOICE OVERRIDE: Byte borrows this screen mid-interaction ---
+        # voice_state arrives over the same SSE stream as the rest of CONFIG,
+        # so there is nothing extra to poll. 'idle' falls through untouched and
+        # the screen renders its configured widget exactly as before.
+        if is_voice_screen:
+            vstate = str(CONFIG.get("voice_state", "idle") or "idle").lower()
+            if vstate != voice_prev:
+                voice_prev = vstate
+                voice_since = now
+            if vstate != "idle":
+                try:
+                    img = widget_byte.render(
+                        vstate,
+                        question=CONFIG.get("voice_question", "") or "",
+                        answer=CONFIG.get("voice_answer", "") or "",
+                        since=voice_since or now,
+                    )
+                    if img is not None:
+                        panel.show(img)
+                        time.sleep(0.3)          # animation cadence
+                        continue
+                except Exception as e:
+                    print(f"[voice] render failed: {e}")
 
         name = CONFIG.get(key, "")
 
