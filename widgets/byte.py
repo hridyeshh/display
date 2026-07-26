@@ -50,6 +50,17 @@ _FONTS = {
     "tiny":   _font(P2P, 6),   # smallest text
 }
 
+# Answer type ladder, largest first: the biggest step whose wrapped text still
+# fits the answer box wins, so a short reply is readable across the room and
+# only a genuinely long one steps down. (font, line-height) pairs.
+_ANSWER_STEPS = [
+    (_font(VT, 52), 46),
+    (_font(VT, 40), 36),
+    (_font(VT, 32), 29),
+    (_font(VT, 26), 24),
+    (_font(VT, 22), 20),
+]
+
 
 def _frame():
     return int(time.time() / FRAME_MS)
@@ -237,23 +248,25 @@ def render_byte_speaking(answer="", elapsed=None, source=None):
 
     draw_byte(d, PAD - 4, 46, "speaking", p=2, f=f)
 
-    # Size the answer to its length: a bare "4" gets the hero treatment, a
-    # sentence wraps as body text. Anything longer is clipped rather than
-    # spilling off-screen — the answer is also spoken, so the screen is a recap.
+    # Fit the answer as large as it will go: walk the ladder until the wrapped
+    # text fits the box, so "4" fills the screen and a paragraph merely shrinks
+    # rather than being set in unreadably small type.
     text = str(answer).strip()
     max_w = W - 2 * (PAD - 4)
-    if len(text) <= 6:
-        d.text((PAD - 4, 100), text, font=_FONTS["hero"], fill=FG)
-    elif len(text) <= 22:
-        y = 104
-        for ln in _wrap(d, text, _FONTS["mid"], max_w, max_lines=3):
-            d.text((PAD - 4, y), ln, font=_FONTS["mid"], fill=FG)
-            y += 32
-    else:
-        y = 96
-        for ln in _wrap(d, text.upper(), _FONTS["body"], max_w, tracking=1, max_lines=9):
-            tracked(d, (PAD - 4, y), ln, _FONTS["body"], FG, tracking=1)
-            y += 16
+    top, bottom = 92, 252                       # answer box, above the divider
+    avail = bottom - top
+    font, lh, lines = _ANSWER_STEPS[-1][0], _ANSWER_STEPS[-1][1], None
+    for step_font, step_lh in _ANSWER_STEPS:
+        wrapped = _wrap(d, text, step_font, max_w)
+        if len(wrapped) * step_lh <= avail:
+            font, lh, lines = step_font, step_lh, wrapped
+            break
+    if lines is None:                           # longer than even the smallest
+        lines = _wrap(d, text, font, max_w, max_lines=max(1, avail // lh))
+    y = top if len(lines) > 1 else top + 8       # single line sits optically centred
+    for ln in lines:
+        d.text((PAD - 4, y), ln, font=font, fill=FG)
+        y += lh
 
     d.rectangle([PAD - 4, 258, W - PAD + 4, 258], fill=LINE)
     for i in range(22):                                  # waveform
