@@ -226,7 +226,15 @@ def fetch_config_loop():
             with requests.get(events_url, stream=True, timeout=(5, 60)) as resp:
                 if resp.status_code != 200: raise RuntimeError(f"status {resp.status_code}")
                 fails = 0
-                for raw in resp.iter_lines(decode_unicode=True):
+                # chunk_size=1 is what makes this stream live. The default 512
+                # makes iter_lines read the socket in 512-byte blocks, so a
+                # small event is held until enough later bytes arrive to fill
+                # the buffer — a ~80 byte voice_state event could sit there for
+                # seconds waiting on the 30s keepalive ping, then land batched
+                # with the idle that follows it. Config payloads are ~250 bytes
+                # and nearly fill the buffer on their own, which is why screen
+                # switches felt instant while voice did not.
+                for raw in resp.iter_lines(chunk_size=1, decode_unicode=True):
                     if not raw: continue          
                     if raw.startswith(":"): continue          
                     if raw.startswith("data:"): _apply_event_data(raw[len("data:"):])
