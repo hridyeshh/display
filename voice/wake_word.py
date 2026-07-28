@@ -99,7 +99,7 @@ LISTENING_URL = BACKEND + "/voice/listening"
 # drives the rest of the exchange. The Pi keeps no secrets.
 AUDIO_URL = BACKEND + "/voice/audio"
 # Answer text goes back out and returns as spoken WAV. Same reasoning: the
-# ElevenLabs key stays on the server.
+# Groq key stays on the server.
 SPEECH_URL = BACKEND + "/voice/speech"
 
 # Playback device, by the udev-pinned name rather than a card number — see
