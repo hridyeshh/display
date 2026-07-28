@@ -329,6 +329,23 @@ def calendar_loop():
         except Exception as ex: pass
         time.sleep(60)
 
+def _wait(seconds, is_voice_screen):
+    """Sleep between frames, but wake early when Byte needs the screen.
+
+    On the voice screen this tail sleep is the last thing standing between the
+    SSE event and Byte appearing — sleeping through a whole second of it is why
+    the listening face showed up seconds after the wake word. Everywhere else
+    it is a plain sleep.
+    """
+    if not is_voice_screen:
+        time.sleep(seconds)
+        return
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if str(CONFIG.get("voice_state", "idle") or "idle").lower() != "idle":
+            return
+        time.sleep(0.05)
+
 def screen_loop(panel, key):
     sleeping = False
     is_cal_screen = (key == CAL_SCREEN)
@@ -462,8 +479,8 @@ def screen_loop(panel, key):
             img = render_named(name, key)
             img = apply_encoder_modifications(img, screen_num)
             panel.show(img)
-        except Exception: time.sleep(1.0)
-        time.sleep(0.05 if name == "gif" else 1.0)
+        except Exception: _wait(1.0, is_voice_screen)
+        _wait(0.05 if name == "gif" else 1.0, is_voice_screen)
 
 def apply_encoder_modifications(img, screen_num):
     img = img.copy()

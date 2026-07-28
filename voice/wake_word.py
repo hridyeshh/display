@@ -8,6 +8,7 @@ speaker stops, and drops a .wav in recordings/ for Phase 4 to transcribe.
 No speech-to-text and no Claude here — this phase ends at the .wav.
 """
 
+import io
 import os
 import sys
 import time
@@ -28,6 +29,14 @@ import requests
 # card 2 is the USB PnP Sound Device; card 1 (AB13X) reads near-silent.
 MIC_DEVICE = os.environ.get("DESKY_MIC_DEVICE", "plughw:2,0")
 
+# The USB PnP mic reads quiet from arm's length, and openWakeWord was trained on
+# normal-level speech, so a faint signal scores low and the wake word misses.
+# Every frame is scaled on the way in, before detection, the silence gate or the
+# saved .wav sees it. Analog gain would beat this multiply — `amixer -c 2 sset
+# Mic 100%` then `alsactl store` — but that is per-device and dies with a
+# swapped mic, so this stays as the portable knob.
+MIC_GAIN = float(os.environ.get("DESKY_MIC_GAIN", "3.0"))
+
 # openWakeWord score that counts as a hit. The custom hey_desky model is
 # trained on a small sample set, so this is the first knob to turn if it
 # either misses real triggers (lower) or fires at ordinary speech (raise).
@@ -39,10 +48,11 @@ COOLDOWN_SEC = 3.0
 
 MAX_RECORD_SEC = 5.0
 
-# int16 RMS below this counts as silence. Measured ambient on this mic is
-# ~515, so anything at or under that would never let a recording stop early.
-# Re-check with `--calibrate` if the mic or the room moves.
-SILENCE_RMS = 1200
+# int16 RMS below this counts as silence, in post-gain units. Measured ambient
+# on this mic is ~515 raw, so the floor has to scale with MIC_GAIN — a gained-up
+# room otherwise never reads as quiet and every recording runs to the cap.
+# Re-check with `--calibrate` (which also prints post-gain) if the room moves.
+SILENCE_RMS = 1200 * MIC_GAIN
 SILENCE_HOLD_SEC = 1.5
 
 # The wake word only fires once it has been fully spoken, and people run their
@@ -123,11 +133,16 @@ def open_mic():
 
 
 def read_frame(proc):
-    """One 80 ms frame, or None if arecord died (mic unplugged)."""
+    """One 80 ms frame, gain applied, or None if arecord died (mic unplugged)."""
     buf = proc.stdout.read(FRAME_BYTES)
     if buf is None or len(buf) < FRAME_BYTES:
         return None
-    return np.frombuffer(buf, dtype=np.int16)
+    frame = np.frombuffer(buf, dtype=np.int16)
+    if MIC_GAIN == 1.0:
+        return frame
+    # int32 before the multiply, then clip: scaling in int16 wraps a loud
+    # sample to the opposite sign, which the model reads as noise.
+    return np.clip(frame.astype(np.int32) * MIC_GAIN, -32768, 32767).astype(np.int16)
 
 
 def notify_listening():
@@ -189,7 +204,13 @@ def listen_forever():
     last_fire = 0.0
 
     proc = open_mic()
-    log(f"listening on {MIC_DEVICE} (threshold {DETECTION_THRESHOLD})")
+    log(f"listening on {MIC_DEVICE} (threshold {DETECTION_THRESHOLD}, gain {MIC_GAIN})")
+    # Detection can only be as prompt as the loop is fast: if predict() takes
+    # longer than the 80 ms of audio each frame holds, arecord's pipe backs up
+    # and every trigger fires later than the last. Measured, not fixed — the
+    # number says whether a late screen is this loop or the network.
+    frames_seen = 0
+    started = time.monotonic()
     try:
         while True:
             frame = read_frame(proc)
@@ -198,6 +219,12 @@ def listen_forever():
                 # let systemd's Restart=always retry until it comes back.
                 raise SystemExit(f"arecord stopped on {MIC_DEVICE}")
             preroll.append(frame)
+
+            frames_seen += 1
+            if frames_seen % 250 == 0:  # ~20s of audio
+                lag = (time.monotonic() - started) - frames_seen * FRAME_SEC
+                if lag > 1.0:
+                    log(f"behind live audio by {lag:.1f}s — detection will be late")
 
             score = oww.predict(frame).get(label, 0.0)
             if score < DETECTION_THRESHOLD:
@@ -219,6 +246,11 @@ def listen_forever():
             # still sitting in it re-fires the moment we resume.
             preroll.clear()
             oww.reset()
+
+            # Recording and saving consumed frames this counter never saw, so
+            # restart the drift measurement rather than blame them on predict().
+            frames_seen = 0
+            started = time.monotonic()
     finally:
         proc.terminate()
 
@@ -249,6 +281,9 @@ def selftest():
     """Runs without a mic, so it works on the dev machine too."""
     quiet = np.zeros(FRAME_SAMPLES, dtype=np.int16)
     loud = np.full(FRAME_SAMPLES, 3000, dtype=np.int16)
+    # Clearly above the floor whatever MIC_GAIN is, so raising gain cannot
+    # silently turn the gate's "speech" fixture into more silence.
+    speech = np.full(FRAME_SAMPLES, min(int(SILENCE_RMS * 2), 30000), dtype=np.int16)
 
     assert rms(quiet) == 0.0
     assert abs(rms(loud) - 3000) < 1.0
@@ -265,15 +300,30 @@ def selftest():
     gate = SilenceGate()
     for _ in range(gate.needed - 1):
         gate.feed(quiet)
-    assert not gate.feed(loud)
+    assert not gate.feed(speech)
     assert gate.quiet_run == 0
     for _ in range(gate.needed - 1):
         assert not gate.feed(quiet)
     assert gate.feed(quiet)
 
-    # A frame at the measured ambient floor must still read as silence,
-    # otherwise recordings never stop early.
-    assert not SilenceGate().feed(np.full(FRAME_SAMPLES, 515, dtype=np.int16))
+    # A frame at the measured ambient floor must still read as silence *after*
+    # gain, otherwise recordings never stop early and always run to the cap.
+    ambient = np.full(FRAME_SAMPLES, int(515 * MIC_GAIN), dtype=np.int16)
+    assert not SilenceGate().feed(ambient)
+
+    # read_frame must lift a quiet frame and clip a loud one rather than wrap it.
+    class FakeProc:
+        def __init__(self, frame):
+            self.stdout = io.BytesIO(frame.tobytes())
+
+    faint = np.full(FRAME_SAMPLES, 500, dtype=np.int16)
+    assert abs(rms(read_frame(FakeProc(faint))) - 500 * MIC_GAIN) < 1.0
+    near_full = np.full(FRAME_SAMPLES, 20000, dtype=np.int16)
+    out = read_frame(FakeProc(near_full))
+    assert out.min() > 0, "gain wrapped a loud sample negative"
+    assert out.max() <= 32767
+    # A short read (arecord died mid-frame) is None, not a truncated frame.
+    assert read_frame(FakeProc(faint[:10])) is None
 
     assert Path(find_model()).exists()
 
