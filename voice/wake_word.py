@@ -52,7 +52,11 @@ MIC_GAIN = float(os.environ.get("DESKY_MIC_GAIN", "1.0"))
 # openWakeWord score that counts as a hit. The custom hey_desky model is
 # trained on a small sample set, so this is the first knob to turn if it
 # either misses real triggers (lower) or fires at ordinary speech (raise).
-DETECTION_THRESHOLD = 0.5
+DETECTION_THRESHOLD = 0.4
+
+# Below the threshold but worth logging, so misses leave evidence. Not a second
+# threshold — nothing fires off this, it only writes a line.
+NEAR_MISS_SCORE = 0.15
 
 # Ignore further hits right after one fires. Without this the tail of the
 # wake word re-triggers the model while we are already recording.
@@ -83,7 +87,12 @@ SILENCE_HOLD_SEC = 2.5
 # question straight into it. Keep a little audio from before the trigger.
 PREROLL_SEC = 0.5
 
-LISTENING_URL = "https://web-production-12607.up.railway.app/voice/listening"
+BACKEND = os.environ.get(
+    "DESKY_BACKEND", "https://web-production-12607.up.railway.app").rstrip("/")
+LISTENING_URL = BACKEND + "/voice/listening"
+# The recording goes to the server, which holds the Groq and Anthropic keys and
+# drives the rest of the exchange. The Pi keeps no secrets.
+AUDIO_URL = BACKEND + "/voice/audio"
 
 # --- fixed by openWakeWord ------------------------------------------------
 # The melspectrogram frontend assumes 16 kHz mono int16 in 80 ms frames.
@@ -178,6 +187,25 @@ def notify_listening():
         log(f"POST /voice/listening failed: {e}")
 
 
+def send_audio(path):
+    """Upload the recording; the server transcribes it and answers from there.
+
+    The reply only arrives once Whisper and Claude have both run, so the timeout
+    is generous — but the screen does not wait on it. Byte moves to 'thinking'
+    the moment the server has the transcript, over SSE.
+    """
+    try:
+        with open(path, "rb") as f:
+            r = requests.post(
+                AUDIO_URL, files={"file": (path.name, f, "audio/wav")}, timeout=90)
+        if r.status_code == 200:
+            log(f"answered: {r.text[:160]}")
+        else:
+            log(f"POST /voice/audio -> {r.status_code}: {r.text[:160]}")
+    except Exception as e:
+        log(f"POST /voice/audio failed: {e}")
+
+
 def save_wav(frames):
     RECORDINGS_DIR.mkdir(exist_ok=True)
     path = RECORDINGS_DIR / f"{datetime.now():%Y%m%d_%H%M%S}.wav"
@@ -226,6 +254,7 @@ def listen_forever():
 
     preroll = deque(maxlen=max(1, int(PREROLL_SEC / FRAME_SEC)))
     last_fire = 0.0
+    last_near_miss = 0.0
 
     proc = open_mic()
     log(f"listening on {MIC_DEVICE} (threshold {DETECTION_THRESHOLD}, gain {MIC_GAIN})")
@@ -252,6 +281,14 @@ def listen_forever():
 
             score = oww.predict(frame).get(label, 0.0)
             if score < DETECTION_THRESHOLD:
+                # A miss is otherwise invisible, which makes "it only hears one
+                # tone" impossible to act on: a 0.45 means the threshold is too
+                # high, a 0.05 means the model does not know that delivery at
+                # all and no threshold will help. Rate-limited so a noisy room
+                # cannot flood the journal.
+                if score >= NEAR_MISS_SCORE and time.monotonic() - last_near_miss > 1.0:
+                    last_near_miss = time.monotonic()
+                    log(f"near miss: {score:.3f}")
                 continue
             if time.monotonic() - last_fire < COOLDOWN_SEC:
                 continue
@@ -264,7 +301,12 @@ def listen_forever():
             threading.Thread(target=notify_listening, daemon=True).start()
 
             frames = record(proc, preroll)
-            log(f"saved {save_wav(frames)}")
+            path = save_wav(frames)
+            log(f"saved {path}")
+            # Off-thread: transcription plus Claude runs to tens of seconds, and
+            # blocking here would back up arecord's pipe and make the next wake
+            # word land late — the same lag the drift check below watches for.
+            threading.Thread(target=send_audio, args=(path,), daemon=True).start()
 
             # Clear the model's internal audio buffer, otherwise the wake word
             # still sitting in it re-fires the moment we resume.
