@@ -39,13 +39,15 @@ MIC_DEVICE = os.environ.get("DESKY_MIC_DEVICE", "plughw:mic,0")
 # Every frame is scaled on the way in, before detection, the silence gate or the
 # saved .wav sees it.
 #
-# This is the weaker of the two knobs and should stay the fallback: multiplying
-# samples scales the noise with the signal, so it cannot improve SNR — it only
-# makes a quiet recording louder. Analog gain before the ADC does improve SNR.
-# Measured 2026-07-29: this mic's capture control sits at 0 of 0-16 (0.00 dB)
-# with AGC on, so there is a lot of real gain still on the table:
-#   amixer -c mic sset Mic 16 && sudo alsactl store
-MIC_GAIN = float(os.environ.get("DESKY_MIC_GAIN", "3.0"))
+# Now 1.0, i.e. off, and it should stay off while analog gain is available.
+# Multiplying samples scales noise with signal and cannot improve SNR; analog
+# gain before the ADC can. The mic's capture control is at 16/16 (+23.81 dB) as
+# of 2026-07-29, and stacking 3x on top of that clipped real speech — the two
+# recordings from 01:18 peaked at 32768 with 424 and 106 saturated samples,
+# which distorts the melspectrogram openWakeWord scores on. Raise the analog
+# knob first (`amixer -c mic sset Mic 16 && sudo alsactl store`); reach for this
+# only if the mic is swapped for one with no capture control of its own.
+MIC_GAIN = float(os.environ.get("DESKY_MIC_GAIN", "1.0"))
 
 # openWakeWord score that counts as a hit. The custom hey_desky model is
 # trained on a small sample set, so this is the first knob to turn if it
@@ -56,14 +58,26 @@ DETECTION_THRESHOLD = 0.5
 # wake word re-triggers the model while we are already recording.
 COOLDOWN_SEC = 3.0
 
-MAX_RECORD_SEC = 5.0
+# Room for the pause plus a full question. 5.0 was tight once SILENCE_HOLD_SEC
+# grew: the 01:18 recording spent 1.4s of its budget on the gap alone.
+MAX_RECORD_SEC = 8.0
 
-# int16 RMS below this counts as silence, in post-gain units. Measured ambient
-# on this mic is ~515 raw, so the floor has to scale with MIC_GAIN — a gained-up
-# room otherwise never reads as quiet and every recording runs to the cap.
+# int16 RMS below this counts as silence, in post-gain units. Measured from the
+# 01:18 recordings at +23.81 dB analog: the room floor sits at 290-745 raw and
+# speech at 1700+, so 1200 splits them with room on both sides. Still scaled by
+# MIC_GAIN, since a gained-up room would otherwise never read as quiet and every
+# recording would run to the cap.
 # Re-check with `--calibrate` (which also prints post-gain) if the room moves.
 SILENCE_RMS = 1200 * MIC_GAIN
-SILENCE_HOLD_SEC = 1.5
+
+# How long the room must stay quiet before we call the question finished.
+#
+# 1.5s was too short, and it is the whole reason questions were being cut off.
+# People say "hey desky", pause while the screen reacts, *then* ask — and that
+# pause measured 1.4s, against a 1.5s window. One recording survived it by two
+# frames; the next did not and captured the wake word alone. 2.5s clears a
+# natural pause without leaving the recording hanging on a false trigger.
+SILENCE_HOLD_SEC = 2.5
 
 # The wake word only fires once it has been fully spoken, and people run their
 # question straight into it. Keep a little audio from before the trigger.
@@ -289,6 +303,8 @@ def calibrate(seconds=10):
 
 def selftest():
     """Runs without a mic, so it works on the dev machine too."""
+    global MIC_GAIN  # the clip check below forces it on; restored in a finally
+
     quiet = np.zeros(FRAME_SAMPLES, dtype=np.int16)
     loud = np.full(FRAME_SAMPLES, 3000, dtype=np.int16)
     # Clearly above the floor whatever MIC_GAIN is, so raising gain cannot
@@ -301,7 +317,10 @@ def selftest():
     assert rms(np.full(FRAME_SAMPLES, 32000, dtype=np.int16)) > 31000
 
     gate = SilenceGate()
-    assert gate.needed == 19, gate.needed  # 1.5s / 80ms
+    assert gate.needed == 31, gate.needed  # 2.5s / 80ms
+    # The gap between "hey desky" and the question measured 17 frames. The hold
+    # window has to clear that comfortably or recordings stop before the ask.
+    assert gate.needed > 17 + 8, "hold window too short for the wake-word pause"
     for i in range(gate.needed - 1):
         assert not gate.feed(quiet), f"stopped early at frame {i}"
     assert gate.feed(quiet), "did not stop after the hold window"
@@ -328,12 +347,20 @@ def selftest():
 
     faint = np.full(FRAME_SAMPLES, 500, dtype=np.int16)
     assert abs(rms(read_frame(FakeProc(faint))) - 500 * MIC_GAIN) < 1.0
-    near_full = np.full(FRAME_SAMPLES, 20000, dtype=np.int16)
-    out = read_frame(FakeProc(near_full))
-    assert out.min() > 0, "gain wrapped a loud sample negative"
-    assert out.max() <= 32767
     # A short read (arecord died mid-frame) is None, not a truncated frame.
     assert read_frame(FakeProc(faint[:10])) is None
+
+    # MIC_GAIN ships at 1.0, which skips the scaling path entirely, so force it
+    # on to prove the clip still holds for anyone who turns the knob back up.
+    original_gain, MIC_GAIN = MIC_GAIN, 3.0
+    try:
+        near_full = np.full(FRAME_SAMPLES, 20000, dtype=np.int16)
+        out = read_frame(FakeProc(near_full))
+        assert out.min() > 0, "gain wrapped a loud sample negative"
+        assert out.max() <= 32767
+        assert abs(rms(read_frame(FakeProc(faint))) - 1500) < 1.0
+    finally:
+        MIC_GAIN = original_gain
 
     assert Path(find_model()).exists()
 
