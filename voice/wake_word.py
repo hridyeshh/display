@@ -26,15 +26,25 @@ import requests
 # --- tunables -------------------------------------------------------------
 # ALSA capture device. plughw (not hw) so ALSA resamples the mic's native rate
 # down to the 16 kHz openWakeWord needs — the raw hw: device rejects it.
-# card 2 is the USB PnP Sound Device; card 1 (AB13X) reads near-silent.
-MIC_DEVICE = os.environ.get("DESKY_MIC_DEVICE", "plughw:2,0")
+#
+# "mic" is a card *name*, not an index, pinned by /etc/udev/rules.d/85-desky-
+# audio.rules matching the C-Media USB PnP's 08bb:2902. Card numbers move: the
+# Pi Zero 2W has one USB port and everything hangs off a bus-powered hub that
+# re-enumerates in arbitrary order after a replug or a brownout. This mic has
+# been card 1 and card 2 on different boots; the name survives all of it.
+MIC_DEVICE = os.environ.get("DESKY_MIC_DEVICE", "plughw:mic,0")
 
 # The USB PnP mic reads quiet from arm's length, and openWakeWord was trained on
 # normal-level speech, so a faint signal scores low and the wake word misses.
 # Every frame is scaled on the way in, before detection, the silence gate or the
-# saved .wav sees it. Analog gain would beat this multiply — `amixer -c 2 sset
-# Mic 100%` then `alsactl store` — but that is per-device and dies with a
-# swapped mic, so this stays as the portable knob.
+# saved .wav sees it.
+#
+# This is the weaker of the two knobs and should stay the fallback: multiplying
+# samples scales the noise with the signal, so it cannot improve SNR — it only
+# makes a quiet recording louder. Analog gain before the ADC does improve SNR.
+# Measured 2026-07-29: this mic's capture control sits at 0 of 0-16 (0.00 dB)
+# with AGC on, so there is a lot of real gain still on the table:
+#   amixer -c mic sset Mic 16 && sudo alsactl store
 MIC_GAIN = float(os.environ.get("DESKY_MIC_GAIN", "3.0"))
 
 # openWakeWord score that counts as a hit. The custom hey_desky model is

@@ -35,7 +35,7 @@ journalctl -u desky -f                # tail logs
 
 ## Auto-Updates
 
-Push to `main` and the Pi picks it up within 60 seconds. The watcher runs `deploy.sh`, which does a hard reset to `origin/main` and restarts the desky service.
+Push to `main` and the Pi picks it up within 60 seconds. The watcher runs `deploy.sh`, which does a hard reset to `origin/main` and restarts the desky and desky-voice services.
 
 ## Project Structure
 
