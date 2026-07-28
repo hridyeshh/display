@@ -1,0 +1,21 @@
+[Unit]
+Description=Desky "hey desky" wake word listener
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+# System python, matching the desky unit as actually installed on the Pi.
+# There is no .venv there; deps go in with --break-system-packages.
+ExecStart=/usr/bin/python3 /home/hridyesh/display/voice/wake_word.py
+WorkingDirectory=/home/hridyesh/display/voice
+Restart=always
+RestartSec=5
+User=hridyesh
+# Without this, systemd buffers stdout and journalctl shows nothing until the
+# process dies — useless for watching detections live.
+Environment=PYTHONUNBUFFERED=1
+# The mic is only reachable through the audio group.
+SupplementaryGroups=audio
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Phase 3: listen for "hey desky", then record the question that follows.
+
+Runs forever under the desky-voice service. On detection it pokes the Railway
+API so screen2 flips to Byte's listening state immediately, records until the
+speaker stops, and drops a .wav in recordings/ for Phase 4 to transcribe.
+
+No speech-to-text and no Claude here — this phase ends at the .wav.
+"""
+
+import os
+import sys
+import time
+import wave
+import glob
+import threading
+import subprocess
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import requests
+
+# --- tunables -------------------------------------------------------------
+# ALSA capture device. plughw (not hw) so ALSA resamples the mic's native rate
+# down to the 16 kHz openWakeWord needs — the raw hw: device rejects it.
+# card 2 is the USB PnP Sound Device; card 1 (AB13X) reads near-silent.
+MIC_DEVICE = os.environ.get("DESKY_MIC_DEVICE", "plughw:2,0")
+
+# openWakeWord score that counts as a hit. The custom hey_desky model is
+# trained on a small sample set, so this is the first knob to turn if it
+# either misses real triggers (lower) or fires at ordinary speech (raise).
+DETECTION_THRESHOLD = 0.5
+
+# Ignore further hits right after one fires. Without this the tail of the
+# wake word re-triggers the model while we are already recording.
+COOLDOWN_SEC = 3.0
+
+MAX_RECORD_SEC = 5.0
+
+# int16 RMS below this counts as silence. Measured ambient on this mic is
+# ~515, so anything at or under that would never let a recording stop early.
+# Re-check with `--calibrate` if the mic or the room moves.
+SILENCE_RMS = 1200
+SILENCE_HOLD_SEC = 1.5
+
+# The wake word only fires once it has been fully spoken, and people run their
+# question straight into it. Keep a little audio from before the trigger.
+PREROLL_SEC = 0.5
+
+LISTENING_URL = "https://web-production-12607.up.railway.app/voice/listening"
+
+# --- fixed by openWakeWord ------------------------------------------------
+# The melspectrogram frontend assumes 16 kHz mono int16 in 80 ms frames.
+SAMPLE_RATE = 16000
+FRAME_SAMPLES = 1280
+FRAME_BYTES = FRAME_SAMPLES * 2
+FRAME_SEC = FRAME_SAMPLES / SAMPLE_RATE
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+RECORDINGS_DIR = SCRIPT_DIR / "recordings"
+
+
+def log(msg):
+    print(f"[wake] {msg}", flush=True)
+
+
+def rms(frame):
+    """Root-mean-square of an int16 frame, as a float."""
+    # float64 first: int16 squares overflow.
+    return float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+
+
+class SilenceGate:
+    """Decides when the speaker has stopped.
+
+    Fed one frame at a time; returns True once SILENCE_HOLD_SEC of continuous
+    quiet has passed. Any frame above the floor resets the run, so a pause
+    mid-sentence does not cut the recording short.
+    """
+
+    def __init__(self, threshold=SILENCE_RMS, hold_sec=SILENCE_HOLD_SEC):
+        self.threshold = threshold
+        self.needed = max(1, int(round(hold_sec / FRAME_SEC)))
+        self.quiet_run = 0
+
+    def feed(self, frame):
+        if rms(frame) < self.threshold:
+            self.quiet_run += 1
+        else:
+            self.quiet_run = 0
+        return self.quiet_run >= self.needed
+
+
+def find_model():
+    """ONNX, not the .tflite sitting next to it.
+
+    The Pi runs Python 3.13 on aarch64 and tflite-runtime publishes no wheel
+    for that combination, so openWakeWord's default tflite backend cannot load
+    anything here. The .tflite is kept only as the training artifact.
+    """
+    matches = sorted(glob.glob(str(SCRIPT_DIR / "hey_desky*.onnx")))
+    if not matches:
+        raise SystemExit(f"no hey_desky*.onnx in {SCRIPT_DIR}")
+    # Newest wins if a retrained model is dropped in alongside the old one.
+    return matches[-1]
+
+
+def open_mic():
+    """Capture through arecord rather than PortAudio.
+
+    PortAudio here only enumerates raw hw: devices, which refuse any rate but
+    their native one (48000/44100) — and openWakeWord needs exactly 16 kHz.
+    arecord's plug layer resamples for us, which is also one less dependency.
+    """
+    return subprocess.Popen(
+        ["arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", str(SAMPLE_RATE),
+         "-c", "1", "-t", "raw", "-q", "-"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def read_frame(proc):
+    """One 80 ms frame, or None if arecord died (mic unplugged)."""
+    buf = proc.stdout.read(FRAME_BYTES)
+    if buf is None or len(buf) < FRAME_BYTES:
+        return None
+    return np.frombuffer(buf, dtype=np.int16)
+
+
+def notify_listening():
+    """Tell the server the wake word fired. Never fatal — a dead network
+    should not stop us recording the question."""
+    try:
+        requests.post(LISTENING_URL, timeout=2)
+    except Exception as e:
+        log(f"POST /voice/listening failed: {e}")
+
+
+def save_wav(frames):
+    RECORDINGS_DIR.mkdir(exist_ok=True)
+    path = RECORDINGS_DIR / f"{datetime.now():%Y%m%d_%H%M%S}.wav"
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes(np.concatenate(frames).tobytes())
+    return path
+
+
+def record(proc, preroll):
+    """Record until silence or MAX_RECORD_SEC, reusing the detection stream.
+
+    Reopening the device here would race the still-closing capture handle and
+    swallow the first fraction of a second of the question.
+    """
+    frames = list(preroll)
+    gate = SilenceGate()
+    max_frames = int(MAX_RECORD_SEC / FRAME_SEC)
+
+    for _ in range(max_frames):
+        frame = read_frame(proc)
+        if frame is None:
+            break
+        frames.append(frame)
+        if gate.feed(frame):
+            log("silence, stopping recording")
+            break
+    else:
+        log(f"hit {MAX_RECORD_SEC}s cap, stopping recording")
+
+    return frames
+
+
+def listen_forever():
+    from openwakeword.model import Model
+
+    model_path = find_model()
+    label = Path(model_path).stem
+    log(f"loading {label}")
+    # openwakeword 0.6.0 (the piwheels build for aarch64/py3.13) is ONNX-only:
+    # the arg is wakeword_model_paths, and there is no inference_framework —
+    # passing one falls through **kwargs into AudioFeatures and raises.
+    oww = Model(wakeword_model_paths=[model_path])
+
+    preroll = deque(maxlen=max(1, int(PREROLL_SEC / FRAME_SEC)))
+    last_fire = 0.0
+
+    proc = open_mic()
+    log(f"listening on {MIC_DEVICE} (threshold {DETECTION_THRESHOLD})")
+    try:
+        while True:
+            frame = read_frame(proc)
+            if frame is None:
+                # arecord exited — mic pulled, or the device is busy. Die and
+                # let systemd's Restart=always retry until it comes back.
+                raise SystemExit(f"arecord stopped on {MIC_DEVICE}")
+            preroll.append(frame)
+
+            score = oww.predict(frame).get(label, 0.0)
+            if score < DETECTION_THRESHOLD:
+                continue
+            if time.monotonic() - last_fire < COOLDOWN_SEC:
+                continue
+
+            last_fire = time.monotonic()
+            log(f"wake word detected, confidence: {score:.3f}")
+
+            # Fire-and-forget so a slow Railway round trip does not eat the
+            # start of the question.
+            threading.Thread(target=notify_listening, daemon=True).start()
+
+            frames = record(proc, preroll)
+            log(f"saved {save_wav(frames)}")
+
+            # Clear the model's internal audio buffer, otherwise the wake word
+            # still sitting in it re-fires the moment we resume.
+            preroll.clear()
+            oww.reset()
+    finally:
+        proc.terminate()
+
+
+def calibrate(seconds=10):
+    """Print live RMS so SILENCE_RMS can be set against the real mic."""
+    proc = open_mic()
+    log(f"{seconds}s of RMS on {MIC_DEVICE} — speak for part of it, then stop")
+    try:
+        quiet, loud = [], []
+        for _ in range(int(seconds / FRAME_SEC)):
+            frame = read_frame(proc)
+            if frame is None:
+                raise SystemExit(f"arecord stopped on {MIC_DEVICE}")
+            v = rms(frame)
+            (loud if v > SILENCE_RMS else quiet).append(v)
+            print(f"  rms {v:8.1f}", flush=True)
+        if quiet:
+            print(f"quiet: n={len(quiet)} max={max(quiet):.1f}")
+        if loud:
+            print(f"loud:  n={len(loud)} min={min(loud):.1f} max={max(loud):.1f}")
+        print(f"current SILENCE_RMS={SILENCE_RMS} — it should sit between them")
+    finally:
+        proc.terminate()
+
+
+def selftest():
+    """Runs without a mic, so it works on the dev machine too."""
+    quiet = np.zeros(FRAME_SAMPLES, dtype=np.int16)
+    loud = np.full(FRAME_SAMPLES, 3000, dtype=np.int16)
+
+    assert rms(quiet) == 0.0
+    assert abs(rms(loud) - 3000) < 1.0
+    # Squaring int16 in-place would overflow and give a bogus small RMS.
+    assert rms(np.full(FRAME_SAMPLES, 32000, dtype=np.int16)) > 31000
+
+    gate = SilenceGate()
+    assert gate.needed == 19, gate.needed  # 1.5s / 80ms
+    for i in range(gate.needed - 1):
+        assert not gate.feed(quiet), f"stopped early at frame {i}"
+    assert gate.feed(quiet), "did not stop after the hold window"
+
+    # Speech mid-run must reset the countdown, not shorten it.
+    gate = SilenceGate()
+    for _ in range(gate.needed - 1):
+        gate.feed(quiet)
+    assert not gate.feed(loud)
+    assert gate.quiet_run == 0
+    for _ in range(gate.needed - 1):
+        assert not gate.feed(quiet)
+    assert gate.feed(quiet)
+
+    # A frame at the measured ambient floor must still read as silence,
+    # otherwise recordings never stop early.
+    assert not SilenceGate().feed(np.full(FRAME_SAMPLES, 515, dtype=np.int16))
+
+    assert Path(find_model()).exists()
+
+    # The real question on the Pi is whether the ONNX model loads and scores at
+    # all — that is what the tflite backend could not do. Needs no mic, so it
+    # runs here too; skipped on machines without openwakeword installed.
+    try:
+        from openwakeword.model import Model
+    except ImportError:
+        print("selftest ok (openwakeword not installed, model load skipped)")
+        return
+
+    model_path = find_model()
+    label = Path(model_path).stem
+    oww = Model(wakeword_model_paths=[model_path])
+    scores = oww.predict(quiet)
+    assert label in scores, f"expected key {label!r}, got {list(scores)}"
+    assert 0.0 <= scores[label] <= 1.0, scores[label]
+    print(f"selftest ok (model loaded, silence scores {scores[label]:.4f})")
+
+
+if __name__ == "__main__":
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg == "--selftest":
+        selftest()
+    elif arg == "--calibrate":
+        calibrate()
+    else:
+        listen_forever()
