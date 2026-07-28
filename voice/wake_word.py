@@ -98,6 +98,13 @@ LISTENING_URL = BACKEND + "/voice/listening"
 # The recording goes to the server, which holds the Groq and Anthropic keys and
 # drives the rest of the exchange. The Pi keeps no secrets.
 AUDIO_URL = BACKEND + "/voice/audio"
+# Answer text goes back out and returns as spoken WAV. Same reasoning: the
+# ElevenLabs key stays on the server.
+SPEECH_URL = BACKEND + "/voice/speech"
+
+# Playback device, by the udev-pinned name rather than a card number — see
+# MIC_DEVICE above for why numbers are not stable here.
+SPEAKER_DEVICE = os.environ.get("DESKY_SPEAKER_DEVICE", "plughw:speaker,0")
 
 # --- fixed by openWakeWord ------------------------------------------------
 # The melspectrogram frontend assumes 16 kHz mono int16 in 80 ms frames.
@@ -203,12 +210,46 @@ def send_audio(path):
         with open(path, "rb") as f:
             r = requests.post(
                 AUDIO_URL, files={"file": (path.name, f, "audio/wav")}, timeout=90)
-        if r.status_code == 200:
-            log(f"answered: {r.text[:160]}")
-        else:
+        if r.status_code != 200:
             log(f"POST /voice/audio -> {r.status_code}: {r.text[:160]}")
+            return
+        log(f"answered: {r.text[:160]}")
     except Exception as e:
         log(f"POST /voice/audio failed: {e}")
+        return
+
+    # Speaking is a bonus on top of the answer, which is already on screen via
+    # SSE. A failure here must not look like a failure of the whole exchange.
+    try:
+        answer = r.json().get("answer", "")
+    except Exception:
+        answer = ""
+    if answer:
+        speak(answer)
+
+
+def speak(text):
+    """Say the answer out loud.
+
+    The server returns WAV, header and all, so aplay reads the sample rate off
+    the stream — the Pi never has to agree with the server about a format.
+    """
+    try:
+        r = requests.post(SPEECH_URL, json={"text": text}, timeout=60)
+        if r.status_code != 200:
+            log(f"POST /voice/speech -> {r.status_code}: {r.text[:160]}")
+            return
+        # Playback runs while the loop keeps listening, so Desky can be
+        # interrupted by another wake word mid-sentence. The mic will also hear
+        # this audio; harmless today because we only record after a trigger.
+        p = subprocess.run(["aplay", "-D", SPEAKER_DEVICE, "-q", "-"],
+                           input=r.content, stderr=subprocess.PIPE)
+        if p.returncode != 0:
+            log(f"aplay failed: {p.stderr.decode(errors='replace')[:160]}")
+        else:
+            log(f"spoke {len(r.content)} bytes")
+    except Exception as e:
+        log(f"speak failed: {e}")
 
 
 def save_wav(frames):
