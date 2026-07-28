@@ -57,15 +57,11 @@ DETECTION_THRESHOLD = 0.4
 # Below the threshold but worth logging, so misses leave evidence. Not a second
 # threshold — nothing fires off this, it only writes a line.
 #
-# TEMPORARILY 0.02 (was 0.15) to answer one question: do the tones that fail
-# score just under the threshold, or not register at all? Measured 2026-07-29,
-# hits ran 0.504-0.982 with a single miss at 0.222 and nothing in between, which
-# points at the model rather than the threshold. This floor confirms it by
-# catching what 0.15 was hiding.
-#
-# Put back to 0.15 once answered. At 0.02 ordinary room noise clears the bar, so
-# the 1/sec rate limit at the log site is all that keeps the journal readable.
-NEAR_MISS_SCORE = 0.02
+# 0.15 sits above room noise, so a line here means something speech-like was
+# heard and rejected. Dropping it to 0.02 for a diagnostic run works, but every
+# quiet frame then clears the bar and only the rate limit keeps the journal
+# readable — put it back afterwards.
+NEAR_MISS_SCORE = 0.15
 
 # Ignore further hits right after one fires. Without this the tail of the
 # wake word re-triggers the model while we are already recording.
