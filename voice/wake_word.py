@@ -79,19 +79,13 @@ MAX_RECORD_SEC = 8.0
 # Re-check with `--calibrate` (which also prints post-gain) if the room moves.
 SILENCE_RMS = 1200 * MIC_GAIN
 
-# Frames below this RMS never reach predict(). Not about audio quality — about
-# time. predict() costs a shade more than the 80 ms of audio a frame holds on a
-# Pi Zero 2W (sharing four slow cores with the display process), so a silent
-# room alone pushes the loop permanently behind live audio: measured 2.6s of lag
-# growing to 22s over six minutes. Detection then fires on audio spoken 13s ago
-# and record() reads the stale pause that followed the wake word instead of the
-# question. Skipping silent frames makes reads near-free, so the backlog drains
-# during every gap in speech and lag cannot accumulate.
-#
-# 900 sits between the measured room floor (290-745) and speech (1700+), below
-# SILENCE_RMS so the soft onset of "hey desky" is still scored — the wake word
-# is never detected if its first frames are dropped.
-PREDICT_RMS = 900 * MIC_GAIN
+# Do not gate predict() on frame loudness to save CPU. It was tried on
+# 2026-07-30 at an RMS of 900 and no wake word fired again: real speech at
+# arm's length sits under that floor, and openWakeWord scores a rolling ~1.3s
+# melspectrogram window, so skipping frames also hands it audio stitched from
+# either side of a gap. predict() measures 55 ms per 80 ms frame on this Pi —
+# 0.69x realtime, headroom enough — and drift comes from contention with the
+# display process, which drain() below handles without touching detection.
 
 # How long the room must stay quiet before we call the question finished.
 #
@@ -369,12 +363,6 @@ def listen_forever():
                     started = time.monotonic()
                     continue
 
-            # Cheapest possible filter, and the whole reason the loop keeps up.
-            # A quiet frame cannot hold a wake word, so it never reaches the
-            # model — see PREDICT_RMS.
-            if rms(frame) < PREDICT_RMS:
-                continue
-
             score = oww.predict(frame).get(label, 0.0)
             if score < DETECTION_THRESHOLD:
                 # A miss is otherwise invisible, which makes "it only hears one
@@ -472,15 +460,6 @@ def selftest():
     for _ in range(gate.needed - 1):
         assert not gate.feed(quiet)
     assert gate.feed(quiet)
-
-    # The predict gate decides whether the loop keeps up with live audio. Too
-    # low and a quiet room burns CPU until detection runs seconds late; too high
-    # and the onset of the wake word is dropped and nothing ever fires.
-    assert rms(np.full(FRAME_SAMPLES, int(745 * MIC_GAIN), dtype=np.int16)) < PREDICT_RMS
-    assert rms(np.full(FRAME_SAMPLES, int(1700 * MIC_GAIN), dtype=np.int16)) >= PREDICT_RMS
-    # It must sit below the silence gate: a frame loud enough to hold speech but
-    # too quiet to keep a recording running is the one case that breaks both.
-    assert PREDICT_RMS < SILENCE_RMS
 
     # A frame at the measured ambient floor must still read as silence *after*
     # gain, otherwise recordings never stop early and always run to the cap.
