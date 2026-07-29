@@ -23,6 +23,11 @@ from pathlib import Path
 import numpy as np
 import requests
 
+# Sibling module. Sending a UDP packet has nothing to do with capturing audio,
+# and keeping it out of here means it can be driven straight from the command
+# line to test the bulb on its own — see light.py's docstring.
+from light import apply_action
+
 # --- tunables -------------------------------------------------------------
 # ALSA capture device. plughw (not hw) so ALSA resamples the mic's native rate
 # down to the 16 kHz openWakeWord needs — the raw hw: device rejects it.
@@ -109,6 +114,10 @@ AUDIO_URL = BACKEND + "/voice/audio"
 # Answer text goes back out and returns as spoken WAV. Same reasoning: the
 # Groq key stays on the server.
 SPEECH_URL = BACKEND + "/voice/speech"
+# Reporting a failure the server cannot see for itself. It drives every other
+# state transition, but it has no way to know whether a UDP packet reached the
+# bulb — that happens out here, on a network the server is not on.
+ERROR_URL = BACKEND + "/voice/error"
 
 # Playback device, by the udev-pinned name rather than a card number — see
 # MIC_DEVICE above for why numbers are not stable here.
@@ -228,12 +237,31 @@ def notify_listening():
         log(f"POST /voice/listening failed: {e}")
 
 
+def notify_error():
+    """Put Byte in the error state for a failure only this end can see.
+
+    Best-effort, like notify_listening: if this POST does not land, the screen
+    keeps showing the answered face until the server's reaper clears it, which is
+    cosmetic next to whatever already went wrong.
+    """
+    try:
+        requests.post(ERROR_URL, timeout=2)
+    except Exception as e:
+        log(f"POST /voice/error failed: {e}")
+
+
 def send_audio(path):
     """Upload the recording; the server transcribes it and answers from there.
 
     The reply only arrives once Whisper and Claude have both run, so the timeout
     is generous — but the screen does not wait on it. Byte moves to 'thinking'
     the moment the server has the transcript, over SSE.
+
+    The reply may also carry an action, when the server decided the question was
+    really a command. That rides the response body rather than the SSE stream
+    because it is meant for this device alone: the SSE hub fans out to all three
+    screens and any open browser, and a reconnecting client replaying a stale
+    "lights off" is not a thing worth designing around.
     """
     try:
         with open(path, "rb") as f:
@@ -247,12 +275,34 @@ def send_audio(path):
         log(f"POST /voice/audio failed: {e}")
         return
 
+    try:
+        body = r.json()
+    except Exception:
+        body = {}
+    answer = body.get("answer", "")
+    action = body.get("action")
+
+    # Act first, then speak, so what Desky says matches what actually happened.
+    # The bulb is the one thing in this exchange the server cannot verify — it is
+    # not on this network — so the result of this call, and not the server's
+    # optimism, decides what comes out of the speaker.
+    if action:
+        ok, reason, spoken = apply_action(action)
+        if ok:
+            log(f"action ok: {action}")
+        else:
+            log(f"action failed: {reason}")
+            # The server already broadcast 'answered' before we got this reply,
+            # so the screen is currently claiming success. This is the only way
+            # it learns otherwise.
+            notify_error()
+            # Say what actually went wrong rather than one catch-all: an
+            # unreachable bulb and a rejected command send you to different
+            # places, and light.py is the only thing that knows which it was.
+            answer = spoken
+
     # Speaking is a bonus on top of the answer, which is already on screen via
     # SSE. A failure here must not look like a failure of the whole exchange.
-    try:
-        answer = r.json().get("answer", "")
-    except Exception:
-        answer = ""
     if answer:
         speak(answer)
 
