@@ -79,6 +79,20 @@ MAX_RECORD_SEC = 8.0
 # Re-check with `--calibrate` (which also prints post-gain) if the room moves.
 SILENCE_RMS = 1200 * MIC_GAIN
 
+# Frames below this RMS never reach predict(). Not about audio quality — about
+# time. predict() costs a shade more than the 80 ms of audio a frame holds on a
+# Pi Zero 2W (sharing four slow cores with the display process), so a silent
+# room alone pushes the loop permanently behind live audio: measured 2.6s of lag
+# growing to 22s over six minutes. Detection then fires on audio spoken 13s ago
+# and record() reads the stale pause that followed the wake word instead of the
+# question. Skipping silent frames makes reads near-free, so the backlog drains
+# during every gap in speech and lag cannot accumulate.
+#
+# 900 sits between the measured room floor (290-745) and speech (1700+), below
+# SILENCE_RMS so the soft onset of "hey desky" is still scored — the wake word
+# is never detected if its first frames are dropped.
+PREDICT_RMS = 900 * MIC_GAIN
+
 # How long the room must stay quiet before we call the question finished.
 #
 # 1.5s was too short, and it is the whole reason questions were being cut off.
@@ -188,6 +202,27 @@ def read_frame(proc):
     # int32 before the multiply, then clip: scaling in int16 wraps a loud
     # sample to the opposite sign, which the model reads as noise.
     return np.clip(frame.astype(np.int32) * MIC_GAIN, -32768, 32767).astype(np.int16)
+
+
+def drain(proc):
+    """Throw away audio queued in arecord's pipe, returning the seconds dropped.
+
+    Last resort when the loop has fallen behind anyway: stale frames are worse
+    than no frames, because a late detection makes record() capture the pause
+    after the wake word rather than the question that follows it.
+    """
+    fd = proc.stdout.fileno()
+    os.set_blocking(fd, False)
+    try:
+        dropped = 0
+        while True:
+            buf = proc.stdout.read(FRAME_BYTES)
+            if not buf:
+                break
+            dropped += len(buf)
+    finally:
+        os.set_blocking(fd, True)
+    return dropped / (SAMPLE_RATE * 2)
 
 
 def notify_listening():
@@ -320,10 +355,25 @@ def listen_forever():
             preroll.append(frame)
 
             frames_seen += 1
-            if frames_seen % 250 == 0:  # ~20s of audio
+            if frames_seen % 25 == 0:  # ~2s of audio
                 lag = (time.monotonic() - started) - frames_seen * FRAME_SEC
                 if lag > 1.0:
-                    log(f"behind live audio by {lag:.1f}s — detection will be late")
+                    # Catching up is impossible by definition — the pipe grew
+                    # because we read slower than realtime. Drop the backlog so
+                    # detection and the recording that follows it are live.
+                    secs = drain(proc)
+                    log(f"behind live audio by {lag:.1f}s — dropped {secs:.1f}s of stale audio")
+                    preroll.clear()
+                    oww.reset()
+                    frames_seen = 0
+                    started = time.monotonic()
+                    continue
+
+            # Cheapest possible filter, and the whole reason the loop keeps up.
+            # A quiet frame cannot hold a wake word, so it never reaches the
+            # model — see PREDICT_RMS.
+            if rms(frame) < PREDICT_RMS:
+                continue
 
             score = oww.predict(frame).get(label, 0.0)
             if score < DETECTION_THRESHOLD:
@@ -422,6 +472,15 @@ def selftest():
     for _ in range(gate.needed - 1):
         assert not gate.feed(quiet)
     assert gate.feed(quiet)
+
+    # The predict gate decides whether the loop keeps up with live audio. Too
+    # low and a quiet room burns CPU until detection runs seconds late; too high
+    # and the onset of the wake word is dropped and nothing ever fires.
+    assert rms(np.full(FRAME_SAMPLES, int(745 * MIC_GAIN), dtype=np.int16)) < PREDICT_RMS
+    assert rms(np.full(FRAME_SAMPLES, int(1700 * MIC_GAIN), dtype=np.int16)) >= PREDICT_RMS
+    # It must sit below the silence gate: a frame loud enough to hold speech but
+    # too quiet to keep a recording running is the one case that breaks both.
+    assert PREDICT_RMS < SILENCE_RMS
 
     # A frame at the measured ambient floor must still read as silence *after*
     # gain, otherwise recordings never stop early and always run to the cap.
