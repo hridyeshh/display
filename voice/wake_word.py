@@ -101,6 +101,14 @@ SILENCE_RMS = 1200 * MIC_GAIN
 # natural pause without leaving the recording hanging on a false trigger.
 SILENCE_HOLD_SEC = 2.5
 
+# How long a phone-triggered recording waits before the silence gate is allowed
+# to end it. The wake word arrives mid-speech; a tap arrives before the sentence
+# exists, and you still have to get the phone down and start talking. 3s plus
+# the 2.5s hold is 5.5s of nothing before it gives up, comfortably inside
+# MAX_RECORD_SEC — so the failure mode is a slightly long recording rather than
+# an empty one.
+REMOTE_LEAD_IN_SEC = 3.0
+
 # The wake word only fires once it has been fully spoken, and people run their
 # question straight into it. Keep a little audio from before the trigger.
 PREROLL_SEC = 0.5
@@ -272,12 +280,10 @@ def remote_trigger_loop():
                     nonce = data.get("voice_trigger")
                     if nonce is None:
                         continue
-                    # The first one seen after a connect may be a replay of
-                    # something hours old. Adopting it silently is what stops a
-                    # restart from recording an empty room.
-                    if last is None:
-                        last = nonce
-                        continue
+                    # Every event on this stream is live. The hub is a plain
+                    # fan-out with no history, so connecting replays nothing and
+                    # there is no stale first nonce to skip — an earlier guard
+                    # against one ate the first tap after every restart.
                     if nonce != last:
                         last = nonce
                         log("remote trigger from the app")
@@ -574,21 +580,33 @@ def save_wav(frames):
     return path
 
 
-def record(proc, preroll):
+def record(proc, preroll, grace_sec=0.0):
     """Record until silence or MAX_RECORD_SEC, reusing the detection stream.
 
     Reopening the device here would race the still-closing capture handle and
     swallow the first fraction of a second of the question.
+
+    grace_sec holds the silence gate shut for the first stretch of the
+    recording. The wake word needs none of it — you have just spoken, so the
+    gate starts from speech — but a button on a phone is pressed *before* the
+    sentence exists, and without a lead-in the whole recording is 2.5s of a
+    room going quiet.
     """
     frames = list(preroll)
     gate = SilenceGate()
     max_frames = int(MAX_RECORD_SEC / FRAME_SEC)
+    grace_frames = int(grace_sec / FRAME_SEC)
 
-    for _ in range(max_frames):
+    for i in range(max_frames):
         frame = read_frame(proc)
         if frame is None:
             break
         frames.append(frame)
+        # Not fed rather than fed-and-ignored: the gate counts consecutive
+        # quiet frames, so skipping them leaves the run at zero, which is what
+        # "we are still waiting for you to start" means.
+        if i < grace_frames:
+            continue
         if gate.feed(frame):
             log("silence, stopping recording")
             break
@@ -656,9 +674,11 @@ def listen_forever():
             # then takes exactly the same path: record until silence, upload,
             # answer. Checked before predict() because it costs nothing and the
             # tap should not wait on a frame that was going to miss anyway.
-            if REMOTE_TRIGGER.is_set():
+            remote = REMOTE_TRIGGER.is_set()
+            if remote:
                 REMOTE_TRIGGER.clear()
                 last_fire = time.monotonic()
+                log("remote trigger — recording")
                 # No notify_listening: the endpoint that set this flag already
                 # put the row in 'listening', and posting again would only
                 # re-broadcast a state the screen is showing.
@@ -684,7 +704,8 @@ def listen_forever():
                 # start of the question.
                 threading.Thread(target=notify_listening, daemon=True).start()
 
-            frames = record(proc, preroll)
+            frames = record(proc, preroll,
+                            grace_sec=REMOTE_LEAD_IN_SEC if remote else 0.0)
             path = save_wav(frames)
             log(f"saved {path}")
             # Off-thread: transcription plus Claude runs to tens of seconds, and
@@ -765,6 +786,36 @@ def selftest():
     # gain, otherwise recordings never stop early and always run to the cap.
     ambient = np.full(FRAME_SAMPLES, int(515 * MIC_GAIN), dtype=np.int16)
     assert not SilenceGate().feed(ambient)
+
+    # The lead-in is the whole reason a phone-triggered ask records anything:
+    # without it a tap captures 2.5s of a quiet room and Whisper hears nothing.
+    class SilentProc:
+        """A mic that only ever returns silence."""
+        def __init__(self):
+            self.reads = 0
+
+        def read_frame(self):
+            self.reads += 1
+            return quiet
+
+    def record_frames(grace_sec):
+        mic = SilentProc()
+        real_read = globals()["read_frame"]
+        globals()["read_frame"] = lambda proc: proc.read_frame()
+        try:
+            return len(record(mic, [], grace_sec=grace_sec))
+        finally:
+            globals()["read_frame"] = real_read
+
+    hold = SilenceGate().needed
+    # No grace: silence alone ends it after exactly the hold window.
+    assert record_frames(0.0) == hold, record_frames(0.0)
+    # With one: the grace frames come first, then the same hold.
+    lead = int(REMOTE_LEAD_IN_SEC / FRAME_SEC)
+    assert record_frames(REMOTE_LEAD_IN_SEC) == lead + hold, record_frames(REMOTE_LEAD_IN_SEC)
+    # And the whole of it still has to fit inside the cap, or the lead-in would
+    # only ever produce recordings that ran to the ceiling.
+    assert lead + hold < int(MAX_RECORD_SEC / FRAME_SEC), "lead-in overruns MAX_RECORD_SEC"
 
     # read_frame must lift a quiet frame and clip a loud one rather than wrap it.
     class FakeProc:
