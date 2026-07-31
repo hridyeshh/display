@@ -12,6 +12,7 @@ import io
 import os
 import sys
 import time
+import json
 import wave
 import glob
 import threading
@@ -404,11 +405,30 @@ def speak(text):
 
 ALARM_FILE = "/dev/shm/desky_alarm"
 
+# The ring itself. Decoded from "alarm tune.mp3" on a dev machine rather than
+# here —
+#   afconvert -f WAVE -d LEI16@22050 -c 1 "alarm tune.mp3" voice/alarm.wav
+# — because aplay takes WAV and nothing else, and putting an mp3 decoder in the
+# one path that has to work at six in the morning buys nothing: the decode is
+# identical every day, so it happens once, before the file is ever committed.
+# Mono at 22 kHz is 1.8 MB for the 42s, and a small speaker on the end of a Pi
+# has no use for the stereo 48 kHz the original carries.
+ALARM_TUNE = SCRIPT_DIR / "alarm.wav"
+
+# How much of the tune to hand aplay at a time. It drains its pipe at playback
+# speed, so writing the whole thing in one go blocks for the full 42s and a
+# dismissal goes unread until the pass ends. 8 KB is ~0.19s of audio here.
+ALARM_CHUNK_BYTES = 8192
+
 # Gap between repeats. Long enough to be a repeating alarm rather than a wall of
 # noise, short enough that the silence never reads as "it stopped".
+#
+# Measured from the start of a pass, not its end, so the tune — which outruns
+# this several times over — simply repeats without a gap. What it still paces is
+# the beep fallback, which is over in 1.2s.
 ALARM_REPEAT_SEC = 8.0
 
-# The fallback tone, for when the network or the TTS quota is gone.
+# The fallback, for a deploy or a checkout that lost the tune.
 ALARM_BEEP_HZ = 880
 ALARM_BEEP_SEC = 1.2
 ALARM_BEEP_AMPLITUDE = 8000
@@ -446,34 +466,70 @@ def beep_wav():
     return _BEEP
 
 
-def alarm_label():
-    """The label of the ringing alarm, or "" — the flag holds "<id> <label>"."""
-    try:
-        with open(ALARM_FILE) as f:
-            parts = f.read().strip().split(" ", 1)
-        return parts[1].strip() if len(parts) > 1 else ""
-    except Exception:
-        return ""
+_TUNE = None
 
 
-def alarm_audio(label):
-    """The audio for this ring, fetched once and reused for every repeat.
+def alarm_audio():
+    """The ring, read once and reused for every repeat.
 
-    Once, not per repeat: re-synthesising every eight seconds would spend the
-    daily TTS quota inside a couple of minutes and then start failing partway
-    through — the alarm would get quieter the longer nobody answered it, which
-    is precisely backwards.
+    Once, not per pass: the file is 1.8 MB and it is the same 1.8 MB every
+    morning, so re-reading it between repeats would only add a disk hit to the
+    gap. It is also read the first time an alarm rings rather than at import, so
+    a service that has been up for a week does not hold it for nothing.
+
+    Falls back to the generated beep when the file is missing. That fallback is
+    the whole reason this cannot fail silently, and it is worth the four lines:
+    a deploy that dropped the tune would otherwise wake nobody at all.
     """
-    text = f"{label}." if label else "Wake up."
+    global _TUNE
+    if _TUNE is None:
+        try:
+            _TUNE = ALARM_TUNE.read_bytes()
+            log(f"alarm tune: {len(_TUNE)} bytes from {ALARM_TUNE.name}")
+        except Exception as e:
+            log(f"no alarm tune ({e}) — falling back to the beep")
+            _TUNE = beep_wav()
+    return _TUNE
+
+
+def play_alarm(wav):
+    """Play one pass of the ring, cut short the moment the alarm flag drops.
+
+    _play() writes the whole buffer and waits, which was fine when a ring was a
+    1.2s beep. A pass of the tune is 42s, and the flag is what a dismiss removes
+    — playing to the end regardless would leave the room ringing for most of a
+    minute after somebody had already switched it off.
+    """
+    p = subprocess.Popen(["aplay", "-D", SPEAKER_DEVICE, "-q", "-"],
+                         stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    dismissed = False
     try:
-        r = requests.post(SPEECH_URL, json={"text": text}, timeout=30)
-        if r.status_code == 200 and r.content:
-            log(f"alarm audio: {len(r.content)} bytes of speech")
-            return r.content
-        log(f"alarm speech -> {r.status_code}: {r.text[:120]} — falling back to the beep")
-    except Exception as e:
-        log(f"alarm speech failed ({e}) — falling back to the beep")
-    return beep_wav()
+        for i in range(0, len(wav), ALARM_CHUNK_BYTES):
+            if not os.path.exists(ALARM_FILE):
+                dismissed = True
+                break
+            p.stdin.write(wav[i:i + ALARM_CHUNK_BYTES])
+        p.stdin.close()
+    except (BrokenPipeError, OSError):
+        # aplay died under us — the speaker was pulled, or the device is busy.
+        # Whatever it wrote to stderr is reported below.
+        pass
+
+    # Either way aplay is still sitting on a second or so of buffered audio, so
+    # a dismissal has to kill it rather than wait it out.
+    while p.poll() is None:
+        if not os.path.exists(ALARM_FILE):
+            dismissed = True
+            p.terminate()
+            break
+        time.sleep(0.25)
+    p.wait()
+
+    # A ring that never reaches the speaker is the one failure this feature
+    # cannot absorb, so a real aplay error leaves a line. Being killed on a
+    # dismiss is not one of those.
+    if not dismissed and p.returncode != 0:
+        log(f"aplay failed: {(p.stderr.read() or b'').decode(errors='replace')[:160]}")
 
 
 # A reminder is the other half of the same handoff: main.py writes the text, this
@@ -539,34 +595,42 @@ def alarm_watch_loop():
     at a time. An alarm wins: a reminder arriving mid-ring waits for the flag to
     drop, which is the right order — the ringing thing is the urgent one.
     """
-    audio = None
-    last = 0.0
+    ringing = False
     while True:
         try:
             if not os.path.exists(ALARM_FILE):
-                # Dropped between repeats: forget the audio, so the next ring
-                # fetches against its own label rather than the last one's.
-                audio = None
+                if ringing:
+                    # The only line saying an alarm ended, and the pair of them
+                    # is how the journal shows one fired at all — alarm_audio()
+                    # logs once in the life of the process and nothing else here
+                    # speaks up on a morning that went fine.
+                    log("alarm stopped")
+                    ringing = False
                 if os.path.exists(REMINDER_FILE):
                     speak_reminder()
                     continue
                 time.sleep(0.5)
                 continue
 
-            if audio is None:
-                audio = alarm_audio(alarm_label())
-                last = 0.0                      # ring now, then on the gap
+            if not ringing:
+                log("alarm ringing")
+                ringing = True
 
-            if time.monotonic() - last >= ALARM_REPEAT_SEC:
-                last = time.monotonic()
-                # A failure here is usually the voice loop holding the speaker
-                # mid-answer. Not worth handling: the next repeat is eight
-                # seconds away and that answer will be over by then.
-                _play(audio)
+            started = time.monotonic()
+            # A failure here is usually the voice loop holding the speaker
+            # mid-answer. Not worth handling: the next pass comes round shortly
+            # and that answer will be over by then.
+            play_alarm(alarm_audio())
+
+            # Paced from the start of the pass, so this is a gap after the beep
+            # and nothing at all after the tune, which has already outrun it.
+            # Broken out of on a dismiss rather than slept through.
+            while (time.monotonic() - started < ALARM_REPEAT_SEC
+                    and os.path.exists(ALARM_FILE)):
+                time.sleep(0.25)
         except Exception as e:
             log(f"alarm loop: {e}")
             time.sleep(1.0)
-        time.sleep(0.25)
 
 
 def save_wav(frames):
@@ -817,6 +881,13 @@ def selftest():
     # only ever produce recordings that ran to the ceiling.
     assert lead + hold < int(MAX_RECORD_SEC / FRAME_SEC), "lead-in overruns MAX_RECORD_SEC"
 
+    # remote_trigger_loop parses the SSE stream with json, and its only failure
+    # mode is silent: a NameError there is swallowed by the loop's catch-all, so
+    # the phone's listen button does nothing while the journal repeats "trigger
+    # stream: name 'json' is not defined" every three seconds. This is the check
+    # that the import is still there.
+    assert json.loads('{"voice_trigger": 1}').get("voice_trigger") == 1
+
     # read_frame must lift a quiet frame and clip a loud one rather than wrap it.
     class FakeProc:
         def __init__(self, frame):
@@ -855,20 +926,78 @@ def selftest():
     assert (beep == 0).any(), "beep is a solid tone, not bursts"
     assert beep_wav() is raw, "beep rebuilt instead of being cached"
 
-    # The flag file carries "<id> <label>", and every part of it is optional
-    # except the id — a label with spaces must survive intact.
+    # The tune has to be a WAV aplay will actually take. A conversion that quietly
+    # produced something else — or an mp3 renamed .wav — fails at exactly one
+    # moment, and it is the moment nobody is awake to debug it.
     import tempfile
-    global ALARM_FILE
-    _real_flag, tmpdir = ALARM_FILE, tempfile.mkdtemp()
-    ALARM_FILE = str(Path(tmpdir) / "desky_alarm")
+    tune = alarm_audio()
+    assert tune is not beep_wav(), f"{ALARM_TUNE} missing — the ring fell back to the beep"
+    assert tune[:4] == b"RIFF" and tune[8:12] == b"WAVE", tune[:12]
+    with wave.open(io.BytesIO(tune)) as w:
+        assert w.getsampwidth() == 2, w.getsampwidth()
+        seconds = w.getnframes() / w.getframerate()
+    # Long enough to be a ring rather than a blip, and short enough that the
+    # dismiss-mid-pass path below is what stops it rather than the file ending.
+    assert seconds > 5, f"alarm tune is {seconds:.1f}s — too short to wake anyone"
+    assert alarm_audio() is tune, "tune re-read instead of being cached"
+
+    # A missing tune must still make a noise. This is the whole reason beep_wav()
+    # survives, so it is worth proving rather than assuming.
+    _real_tune, _real_cache = ALARM_TUNE, _TUNE
+    globals()["ALARM_TUNE"] = Path(tempfile.mkdtemp()) / "gone.wav"
+    globals()["_TUNE"] = None
     try:
-        assert alarm_label() == "", "missing flag file should read as no label"
-        for written, want in (("1 WAKE UP", "WAKE UP"), ("2 CHECK THE OVEN", "CHECK THE OVEN"),
-                              ("3", ""), ("4  ", ""), ("5 x", "x")):
-            Path(ALARM_FILE).write_text(written)
-            assert alarm_label() == want, f"{written!r} -> {alarm_label()!r}, want {want!r}"
+        assert alarm_audio() is beep_wav(), "a missing tune left the alarm silent"
     finally:
-        ALARM_FILE = _real_flag
+        globals()["ALARM_TUNE"], globals()["_TUNE"] = _real_tune, _real_cache
+
+    # A dismiss has to stop the noise now, not at the end of the pass. This is
+    # the whole reason play_alarm feeds aplay in chunks instead of writing once
+    # like _play(): 42s of ringing after somebody switched it off is worse than
+    # the alarm never having gone off.
+    flag = Path(tempfile.mkdtemp()) / "desky_alarm"
+    flag.write_text("1 WAKE UP")
+
+    class FakeAplay:
+        """aplay that plays forever, and a flag dropped two chunks in."""
+        returncode = None
+
+        def __init__(self):
+            self.written = 0
+            self.stdin = self
+            self.stderr = io.BytesIO()
+            self.killed = False
+
+        def write(self, buf):
+            self.written += len(buf)
+            if self.written >= 2 * ALARM_CHUNK_BYTES:
+                flag.unlink(missing_ok=True)
+
+        def close(self):
+            pass
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            self.killed = True
+            self.returncode = -15
+
+        def wait(self):
+            return self.returncode
+
+    fake = FakeAplay()
+    whole = 20 * ALARM_CHUNK_BYTES
+    _real_flag, _real_sub = ALARM_FILE, subprocess
+    globals()["ALARM_FILE"] = str(flag)
+    globals()["subprocess"] = type("Stub", (), {"PIPE": None,
+                                                "Popen": staticmethod(lambda *a, **kw: fake)})
+    try:
+        play_alarm(b"\0" * whole)
+    finally:
+        globals()["ALARM_FILE"], globals()["subprocess"] = _real_flag, _real_sub
+    assert fake.written < whole, "wrote the whole tune despite the dismiss"
+    assert fake.killed, "dismiss left aplay running on its buffered audio"
 
     # A reminder must not leave its flag behind, or main.py's screen state and
     # this process disagree about whether it has been said. The path worth
