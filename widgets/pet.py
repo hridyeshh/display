@@ -1,23 +1,18 @@
 """
 desky widget — Digital pet (Tamagotchi-style)
-240x320 RGB. A pixel creature whose pose/colour reflect its happiness state,
-fed from the backend. Bouncy when happy, droopy when sad, asleep when neglected.
+240x320 RGB. Name and state on the top row, a pixel hamster in the middle, and
+a happiness bar over the last-fed line. Mirrors the `pet` state of DeskyPanel:
+the bar accent steps green → amber → red as happiness drops.
 """
 
-import os
 import time as _time
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
-W, H = 240, 320
-PAD = 22
-
-BG       = (10, 10, 10)
-FG       = (242, 242, 242)
-FG_MUTED = (107, 107, 107)
-LINE     = (34, 34, 34)
-RED      = (252, 60, 68)
-GREEN    = (91, 209, 122)
+from .theme import (
+    W, H, PAD, BG, FG, FG_MUTED, ACCENT_WARM, ACCENT_MUSIC, ACCENT_DONE,
+    label, bar,
+)
 
 # Front-facing pixel hamster (shared with the iOS PetSprite + design mockup).
 # Palette: 1 body, 2 belly, 3 cheek, 4 dark.
@@ -34,20 +29,17 @@ HAMSTER = [
     [0, 0, 1, 1, 1, 2, 2, 1, 1, 1, 0, 0],
     [0, 0, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0],
 ]
-PAL_BODY = {1: (230, 161, 90), 2: (245, 211, 168), 3: (245, 141, 160), 4: (10, 10, 10)}
+PAL_BODY = {1: (230, 161, 90), 2: (245, 211, 168), 3: (245, 141, 160), 4: BG}
+CELL = 12  # 12x11 grid → 144x132, the design's ~150x138 sprite box
 
-
-def _tint_gray(pal):
-    out = {}
-    for k, rgb in pal.items():
-        m = sum(rgb) // 3
-        out[k] = (10, 10, 10) if k == 4 else (m, m, m)
-    return out
-
-FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fonts")
 BACKEND = "https://web-production-12607.up.railway.app"
-CACHE_TTL = 30  # 30s — pet state changes slowly
+CACHE_TTL = 30  # pet state changes slowly
 _cache = {"data": None, "ts": 0.0}
+
+SPRITE_CY = 147
+STAT_Y = 259
+BAR_Y = 275
+FED_Y = 290
 
 
 def _fetch_pet():
@@ -67,18 +59,22 @@ def _fetch_pet():
     return _cache["data"]
 
 
-def _font(name, size):
-    try:
-        return ImageFont.truetype(os.path.join(FONT_DIR, f"{name}.ttf"), size)
-    except OSError:
-        return ImageFont.load_default()
+def _tint_gray(pal):
+    out = {}
+    for k, rgb in pal.items():
+        m = sum(rgb) // 3
+        out[k] = BG if k == 4 else (m, m, m)
+    return out
 
 
-def _lerp(a, b, t):
-    return tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
+def _accent(happiness):
+    """One accent per screen, stepped — matches the design's petColor rule."""
+    if happiness >= 50:
+        return ACCENT_DONE
+    return ACCENT_WARM if happiness >= 20 else ACCENT_MUSIC
 
 
-def _creature(d, cx, cy, pal, eyes_closed, cell=10):
+def _creature(d, cx, cy, pal, eyes_closed, cell=CELL):
     """Draw the pixel hamster centred on (cx, cy) from the shared grid."""
     cols, rows = len(HAMSTER[0]), len(HAMSTER)
     ox = cx - cols * cell // 2
@@ -96,14 +92,7 @@ def _creature(d, cx, cy, pal, eyes_closed, cell=10):
         for ec in (2, 9):
             x0 = ox + ec * cell
             y0 = oy + 4 * cell + cell // 2
-            d.line([x0, y0, x0 + cell, y0], fill=(10, 10, 10), width=3)
-
-
-def _sparkles(d, cx, cy):
-    for sx, sy in ((cx - 60, cy - 40), (cx + 66, cy - 70), (cx + 74, cy - 10), (cx - 70, cy + 20)):
-        d.rectangle([sx, sy, sx + 3, sy + 3], fill=(255, 240, 180))
-        d.point([(sx - 4, sy + 1), (sx + 7, sy + 1), (sx + 1, sy - 4), (sx + 1, sy + 7)],
-                fill=(255, 240, 180))
+            d.line([x0, y0, x0 + cell, y0], fill=BG, width=3)
 
 
 def render(name=None, happiness=None, state=None, hours_since_fed=None):
@@ -117,53 +106,43 @@ def render(name=None, happiness=None, state=None, hours_since_fed=None):
 
     name = (name or "Pixel").upper()
     happiness = int(happiness if happiness is not None else 80)
+    happiness = max(0, min(100, happiness))
     state = state or "content"
     hours = int(hours_since_fed if hours_since_fed is not None else 0)
+    accent = _accent(happiness)
 
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
+    f_lbl = label()
 
-    # Name at top.
-    d.text((W // 2, PAD), name, font=_font("PressStart2P-Regular", 10),
-           fill=FG, anchor="ma")
+    d.text((PAD, PAD + 4), name, font=f_lbl, fill=FG_MUTED, anchor="la")
+    d.text((W - PAD, PAD + 4), str(state).upper(), font=f_lbl, fill=accent, anchor="ra")
 
-    cx, cy = W // 2, 150
-
+    cx, cy = W // 2, SPRITE_CY
     if state == "happy":
-        cy -= 8 if int(_time.time()) % 2 == 0 else 0  # bounce between two poses
-        _sparkles(d, cx, cy)
-        _creature(d, cx, cy, PAL_BODY, False)
+        # ponytail: two discrete poses, not an eased bounce — a single polled
+        # repaint on the Pi has to land on a valid frame either way.
+        _creature(d, cx, cy - (8 if int(_time.time()) % 2 == 0 else 0), PAL_BODY, False)
     elif state == "sad":
-        _creature(d, cx, cy + 8, _tint_gray(PAL_BODY), False)   # drooping, greyed
+        _creature(d, cx, cy + 8, _tint_gray(PAL_BODY), False)
     elif state == "sleepy":
         _creature(d, cx, cy, _tint_gray(PAL_BODY), True)
-        d.text((cx + 62, cy - 78), "Zzz", font=_font("SpaceGrotesk-Medium", 20),
-               fill=FG_MUTED, anchor="la")
+        d.text((cx + 58, cy - 70), "ZZZ", font=f_lbl, fill=FG_MUTED, anchor="la")
     else:
-        _creature(d, cx, cy, PAL_BODY, False)            # content idle
+        _creature(d, cx, cy, PAL_BODY, False)
 
-    # Happiness bar (green→red by percentage).
-    bar_x, bar_y, bar_w, bar_h = PAD, H - 70, W - 2 * PAD, 12
-    d.rectangle([bar_x, bar_y, bar_x + bar_w, bar_y + bar_h], fill=LINE)
-    fill_w = int(bar_w * max(0, min(100, happiness)) / 100)
-    bar_col = _lerp(RED, GREEN, happiness / 100.0)
-    if fill_w > 0:
-        d.rectangle([bar_x, bar_y, bar_x + fill_w, bar_y + bar_h], fill=bar_col)
-    d.text((bar_x, bar_y - 16), "HAPPINESS", font=_font("PressStart2P-Regular", 7),
-           fill=FG_MUTED, anchor="la")
-    d.text((bar_x + bar_w, bar_y - 16), f"{happiness}%",
-           font=_font("PressStart2P-Regular", 7), fill=FG, anchor="ra")
+    d.text((PAD, STAT_Y), "HAPPINESS", font=f_lbl, fill=FG_MUTED, anchor="la")
+    d.text((W - PAD, STAT_Y), f"{happiness}%", font=f_lbl, fill=FG, anchor="ra")
+    bar(d, PAD, BAR_Y, W - 2 * PAD, happiness / 100.0, accent)
 
-    # Last-fed line.
-    fed = "just now" if hours <= 0 else f"{hours}h ago"
-    d.text((W // 2, H - 30), f"LAST FED: {fed.upper()}",
-           font=_font("PressStart2P-Regular", 6), fill=FG_MUTED, anchor="ma")
-
+    fed = "JUST NOW" if hours <= 0 else f"{hours}H AGO"
+    d.text((PAD, FED_Y), f"LAST FED {fed}", font=f_lbl, fill=FG_MUTED, anchor="la")
     return img
 
 
 if __name__ == "__main__":
     # ponytail: offline self-check — one PNG per state, no backend needed.
+    assert _accent(80) == ACCENT_DONE and _accent(34) == ACCENT_WARM and _accent(5) == ACCENT_MUSIC
     for st, hp, hr in (("happy", 92, 0), ("content", 65, 8),
                        ("sad", 34, 18), ("sleepy", 12, 40)):
         render("Pixel", hp, st, hr).save(f"out_pet_{st}.png")

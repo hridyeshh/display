@@ -1,39 +1,36 @@
 """
-desky widget — Word of the Day / Quote
+desky widget — Quote
+240x320 RGB. A muted QUOTE label, the quote set in Press Start 2P at the
+design's 2.1 line-height, and an amber attribution under a hairline.
+Mirrors the `quote` state of DeskyPanel.
 """
-import os
+
+import time
 import requests
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
-W, H = 240, 320
-PAD = 22
+from .theme import (
+    W, H, PAD, BG, FG, FG_MUTED, ACCENT_WARM,
+    label, hairline,
+)
 
-BG          = (10, 10, 10)
-FG          = (242, 242, 242)
-FG_MUTED    = (107, 107, 107)
-ACCENT_WARM = (232, 201, 122)
-LINE        = (34, 34, 34)
-
-FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fonts")
+CACHE_TTL = 21600  # 6h — a quote is not news
 _cache = {"quote": "LOADING...", "author": "SYSTEM", "ts": 0.0}
 
-def _font(name, size):
-    try: return ImageFont.truetype(os.path.join(FONT_DIR, f"{name}.ttf"), size)
-    except OSError: return ImageFont.load_default()
+# Body box: between the top label and the hairline above the attribution.
+TOP = 56
+HAIRLINE_Y = 280
+LINE_RATIO = 2.1  # design line-height for the quote body
+
 
 def _fetch_quote():
-    import time
     now = time.time()
-    
-    # 21600 seconds = 6 hours
-    if (now - _cache["ts"]) < 21600 and _cache["quote"] != "LOADING...":
+    if (now - _cache["ts"]) < CACHE_TTL and _cache["quote"] != "LOADING...":
         return _cache["quote"], _cache["author"]
-    
-    # Update the timestamp BEFORE the request so we never spam the API on a failure
+
+    # Stamp before the request so a failure can't spam the API every repaint.
     _cache["ts"] = now
-    
     try:
-        # Swapped to DummyJSON: much more reliable and robust for IoT devices
         r = requests.get("https://dummyjson.com/quotes/random", timeout=4)
         if r.status_code == 200:
             data = r.json()
@@ -41,70 +38,76 @@ def _fetch_quote():
             _cache["author"] = data.get("author", "Unknown")
     except Exception:
         pass
-        
     return _cache["quote"], _cache["author"]
 
+
 def _wrap_px(text, font, max_w):
-    """Greedy word-wrap by measured pixel width (VT323 isn't fixed-width, so a
-    char count can't guarantee fit)."""
+    """Greedy word-wrap by measured pixel width."""
     lines, cur = [], ""
     for word in text.split():
         trial = word if not cur else cur + " " + word
         if font.getlength(trial) <= max_w:
             cur = trial
         else:
-            if cur: lines.append(cur)
+            if cur:
+                lines.append(cur)
             cur = word
-    if cur: lines.append(cur)
+    if cur:
+        lines.append(cur)
     return lines
+
+
+def _fit(text, max_w, max_h):
+    """Largest body size whose wrapped lines fit the box; clamp if none do."""
+    for size in (8, 7, 6):
+        f = label(size)
+        lh = round(size * LINE_RATIO)
+        wrapped = _wrap_px(text, f, max_w)
+        if len(wrapped) * lh <= max_h:
+            return wrapped, f, lh
+
+    f = label(6)
+    lh = round(6 * LINE_RATIO)
+    wrapped = _wrap_px(text, f, max_w)
+    keep = max(1, max_h // lh)
+    lines = wrapped[:keep]
+    if len(wrapped) > keep:
+        lines[-1] = lines[-1][:-3] + "..."
+    return lines, f, lh
+
 
 def render() -> Image.Image:
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
 
-    f_lbl = _font("PressStart2P-Regular", 8)
-    f_auth = _font("PressStart2P-Regular", 10)
-
-    # Header
-    d.text((PAD, PAD + 4), "INSPIRATION", font=f_lbl, fill=FG_MUTED, anchor="la")
-    d.text((W - PAD, PAD + 4), "QUOTE", font=f_lbl, fill=ACCENT_WARM, anchor="ra")
-
-    hy = PAD + 22
-    d.line([PAD, hy, W - PAD, hy], fill=LINE, width=1)
+    d.text((PAD, PAD + 4), "QUOTE", font=label(), fill=FG_MUTED, anchor="la")
 
     quote, author = _fetch_quote()
+    max_w = W - 2 * PAD
+    lines, f_body, line_h = _fit(f'"{quote.upper()}"', max_w, HAIRLINE_Y - TOP - 8)
 
-    # Fit the quote to the box between the header line and the author line.
-    # Try decreasing font sizes; use the largest whose wrapped lines all fit.
-    top      = 80
-    bottom   = H - PAD - 20          # leave room for the author line
-    max_w    = W - 2 * PAD
-    text     = quote.upper()
-
-    lines, f_body, line_h = [], None, 0
-    for size in range(32, 13, -2):
-        f = _font("VT323-Regular", size)
-        lh = size                     # VT323 line advance ≈ point size
-        wrapped = _wrap_px(text, f, max_w)
-        if len(wrapped) * lh <= (bottom - top):
-            lines, f_body, line_h = wrapped, f, lh
-            break
-    else:
-        # Even at the smallest size it overflows — clamp and ellipsize.
-        f_body = _font("VT323-Regular", 14)
-        line_h = 14
-        wrapped = _wrap_px(text, f_body, max_w)
-        max_lines = max(1, (bottom - top) // line_h)
-        lines = wrapped[:max_lines]
-        if len(wrapped) > max_lines:
-            lines[-1] = lines[-1][:-1] + "..."
-
-    cy = top
+    # The design centres the body in the slack between label and hairline.
+    y = TOP + max(0, (HAIRLINE_Y - TOP - 8 - len(lines) * line_h) // 2)
     for line in lines:
-        d.text((PAD, cy), line, font=f_body, fill=FG, anchor="la")
-        cy += line_h
+        d.text((PAD, y), line, font=f_body, fill=FG, anchor="la")
+        y += line_h
 
-    # Author at the bottom
-    d.text((W - PAD, H - PAD - 10), f"- {author.upper()}", font=f_auth, fill=ACCENT_WARM, anchor="ra")
-
+    hairline(d, HAIRLINE_Y)
+    d.text((W - PAD, H - PAD - 8), f"- {author.upper()}",
+           font=label(), fill=ACCENT_WARM, anchor="ra")
     return img
+
+
+if __name__ == "__main__":
+    # ponytail: _fit is the only real logic — check short, long, and absurd.
+    for name, q in (("short", "Stay retro."),
+                    ("normal", "The impediment to action advances action. "
+                               "What stands in the way becomes the way."),
+                    ("long", "A ship in harbor is safe, but that is not what ships "
+                             "are built for, and the sea will not apologise for the "
+                             "weather it hands you on the way to somewhere better.")):
+        _cache.update({"quote": q, "author": "Marcus Aurelius", "ts": time.time()})
+        img = render()
+        assert img.size == (W, H)
+        img.save(f"out_quote_{name}.png")
+    print("wrote out_quote_*.png")

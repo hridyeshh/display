@@ -63,6 +63,54 @@ MUSIC_IDLE_FALLBACK_SECONDS = 30  # 30 seconds of silence before fallback trigge
 UPCOMING_EVENTS = []
 _FIRED = set()
 
+# --- alarms and reminders --------------------------------------------------
+# The Pi fires these itself, from its own clock, against the list the backend
+# pushes over the same SSE stream as everything else. Nothing asks the server at
+# 07:00 — which is the point: a dead network, or a Railway container restarting
+# at the moment an alarm is due, costs nothing, because the schedule is already
+# here. The backend still owns the bookkeeping; this end reports that it fired
+# and the server decides what that means for a repeating alarm.
+#
+# Both kinds arrive in one list and are told apart by `kind`. They differ only in
+# what happens at the moment they go off: an alarm raises a flag and rings until
+# somebody stops it, a reminder says its piece once and clears itself. That
+# difference is the few lines in _alarm_tick, not a second mechanism.
+ALARM_FILE = "/dev/shm/desky_alarm"          # exists == ringing; wake_word.py rings on it
+ALARM_CMD_FILE = "/dev/shm/desky_alarm_cmd"  # "dismiss" | "snooze", written by encoder.py
+REMINDER_FILE = "/dev/shm/desky_reminder"    # holds the text; wake_word.py speaks it twice
+
+# Must match alarmRingCap in the backend's internal/handlers/scheduled.go. Two
+# copies, because neither side can ask the other at the moment it matters.
+ALARM_RING_CAP = 600
+
+# How long a reminder stays on screen. Matches voiceIdleAfter on the backend, so
+# a reminder lingers exactly as long as a spoken answer does — long enough to
+# read once the audio has finished.
+REMINDER_SHOW_SEC = 25
+
+# How late an alarm may still fire. A Pi that boots at 07:02 should still wake
+# you; one that boots at 11:00 should not — an alarm hours late is noise, and
+# noise you have to get up and stop.
+ALARM_GRACE = 300
+
+# Below this year the system clock has not been set yet. Without the guard a Pi
+# that boots before NTP syncs reads 1970, finds every alarm overdue, and fires
+# the lot at once.
+ALARM_MIN_YEAR = 2025
+
+# The ringing alarm, or id None. Written by alarm_loop, read by every screen.
+ALARM = {"id": None, "time": "", "label": "", "since": 0.0}
+
+# The reminder currently showing, or id None. Unlike ALARM this needs no dismiss
+# and holds no flag anyone waits on — it exists only so the screen knows what to
+# draw until REMINDER_SHOW_SEC is up.
+REMINDER = {"id": None, "text": "", "since": 0.0}
+
+# Alarms already rung, keyed by (id, next_at) rather than id alone: the server
+# advances a repeating alarm to a new next_at when it fires, and that new instant
+# is a genuinely different ring which this set must not suppress.
+_ALARM_FIRED = set()
+
 CONFIG = {"screen1": "clock", "screen2": "music", "screen3": "weather"}
 
 GPIO: int = None  # type: ignore
@@ -337,6 +385,193 @@ def calendar_loop():
         except Exception as ex: pass
         time.sleep(60)
 
+def _alarm_post(path):
+    """Tell the backend what happened to an alarm. Never fatal.
+
+    A failure here costs bookkeeping, not the alarm: the ring is already
+    happening or already over by the time this is called, and the cap ends it
+    either way.
+    """
+    try:
+        requests.post(BACKEND.rstrip("/") + path, timeout=4)
+    except Exception as e:
+        print(f"[alarm] POST {path} failed: {e}")
+
+
+def _alarm_write_flag(alarm_id, label):
+    """Raise the flag wake_word.py rings on. Its absence is what stops it."""
+    try:
+        with open(ALARM_FILE, "w") as f:
+            f.write(f"{alarm_id} {label}")
+    except Exception as e:
+        # The screen still flashes; only the sound is lost. Worth a line, not a
+        # crash.
+        print(f"[alarm] could not write {ALARM_FILE}: {e}")
+
+
+def _alarm_clear(reason, post_path=None):
+    """Stop the ring: drop the flag, forget the alarm, tell the server."""
+    print(f"[alarm] {ALARM['id']} stopped ({reason})")
+    for path in (ALARM_FILE, ALARM_CMD_FILE):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[alarm] could not remove {path}: {e}")
+    if post_path:
+        threading.Thread(target=_alarm_post, args=(post_path,), daemon=True).start()
+    ALARM.update({"id": None, "time": "", "label": "", "since": 0.0})
+
+
+def _alarm_command():
+    """Read and consume a dismiss/snooze written by the encoder, or None."""
+    try:
+        with open(ALARM_CMD_FILE) as f:
+            cmd = f.read().strip().lower()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return None
+    return cmd if cmd in ("dismiss", "snooze") else None
+
+
+def _reminder_clear():
+    """Take the reminder off the screen and drop its flag.
+
+    wake_word.py usually removes the flag first, once it has finished speaking.
+    Removing it again is harmless and covers the case where that process is not
+    running at all — the reminder still shows, silently, rather than sticking.
+    """
+    REMINDER.update({"id": None, "text": "", "since": 0.0})
+    try:
+        os.remove(REMINDER_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[reminder] could not remove {REMINDER_FILE}: {e}")
+
+
+def _fire_reminder(item, now):
+    """Say it once and show it. Nothing to dismiss, nothing to wait for."""
+    text = str(item.get("label") or "")
+    REMINDER.update({"id": item.get("id"), "text": text, "since": now})
+    try:
+        with open(REMINDER_FILE, "w") as f:
+            f.write(text)
+    except Exception as e:
+        # The screen still shows it; only the speech is lost. A reminder you can
+        # read is most of a reminder.
+        print(f"[reminder] could not write {REMINDER_FILE}: {e}")
+    print(f"[reminder] {REMINDER['id']} — {text}")
+    threading.Thread(target=_alarm_post,
+                     args=(f"/scheduled/{REMINDER['id']}/fired",), daemon=True).start()
+
+
+def _alarm_still_ringing(alarm_id):
+    """Whether the server still considers this alarm to be ringing.
+
+    This is how a dismiss from the phone reaches the Pi: the server clears the
+    row and broadcasts the list, and the alarm that used to say ringing:true
+    stops saying it. An alarm that has vanished from the list entirely — deleted
+    mid-ring — reads the same way.
+    """
+    for a in CONFIG.get("scheduled") or []:
+        if a.get("id") == alarm_id:
+            return bool(a.get("ringing"))
+    return False
+
+
+def _alarm_due(now):
+    """The first alarm that should be ringing right now, or None."""
+    for a in CONFIG.get("scheduled") or []:
+        try:
+            if not a.get("enabled"):
+                continue
+            due = float(a.get("next_at") or 0)
+            if due <= 0:
+                continue
+            late = now - due
+            # Not yet, or so long ago that ringing would do more harm than good.
+            if late < 0 or late > ALARM_GRACE:
+                continue
+            if (a.get("id"), int(due)) in _ALARM_FIRED:
+                continue
+            return a
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _alarm_tick():
+    """One pass of the alarm state machine: ring, or decide to stop ringing."""
+    now = time.time()
+    # An unsynced clock is not a clock. Every comparison below is against wall
+    # time, so none of them mean anything until this holds.
+    if time.localtime(now).tm_year < ALARM_MIN_YEAR:
+        return
+
+    # A reminder clears on its own clock. It holds nothing anyone is waiting on,
+    # so this is the whole of its lifecycle after it has been spoken.
+    if REMINDER["id"] is not None and now - REMINDER["since"] > REMINDER_SHOW_SEC:
+        _reminder_clear()
+
+    if ALARM["id"] is not None:
+        cmd = _alarm_command()
+        if cmd == "dismiss":
+            _alarm_clear("dismissed at the desk", f"/scheduled/{ALARM['id']}/dismiss")
+        elif cmd == "snooze":
+            _alarm_clear("snoozed at the desk", f"/scheduled/{ALARM['id']}/snooze")
+        elif now - ALARM["since"] > ALARM_RING_CAP:
+            # Nobody came. Stop rather than ring at an empty room forever, and
+            # tell the server so the row does not sit in a state it has left.
+            _alarm_clear("ring cap reached", f"/scheduled/{ALARM['id']}/dismiss")
+        elif not _alarm_still_ringing(ALARM["id"]):
+            # Dismissed or snoozed from the phone. The server has already
+            # recorded it, so there is nothing to post back.
+            _alarm_clear("stopped from the app")
+        # A ringing alarm holds the floor: nothing else fires underneath it.
+        return
+
+    due = _alarm_due(now)
+    if due is None:
+        return
+
+    # Mark it fired before acting on it. Both branches below can fail — a full
+    # /dev/shm, a dead network — and a failure that left this unset would fire
+    # the same item again on the very next tick, once a second, forever.
+    _ALARM_FIRED.add((due.get("id"), int(float(due.get("next_at")))))
+    if len(_ALARM_FIRED) > 200:
+        _ALARM_FIRED.clear()
+
+    if str(due.get("kind") or "alarm") == "reminder":
+        _fire_reminder(due, now)
+        return
+
+    label = str(due.get("label") or "")
+    ALARM.update({
+        "id": due.get("id"),
+        "time": f"{int(due.get('hour', 0)):02d}:{int(due.get('minute', 0)):02d}",
+        "label": label,
+        "since": now,
+    })
+    _alarm_write_flag(ALARM["id"], label)
+    print(f"[alarm] {ALARM['id']} ringing — {ALARM['time']} {label}")
+    threading.Thread(target=_alarm_post,
+                     args=(f"/scheduled/{ALARM['id']}/fired",), daemon=True).start()
+
+
+def alarm_loop():
+    while True:
+        try:
+            _alarm_tick()
+        except Exception as e:
+            print(f"[alarm] tick failed: {e}")
+        # A second is close enough for an alarm and cheap enough to leave running
+        # forever on a Zero 2W.
+        time.sleep(1.0)
+
+
 def _wait(seconds, is_voice_screen):
     """Sleep between frames, but wake early when Byte needs the screen.
 
@@ -345,12 +580,15 @@ def _wait(seconds, is_voice_screen):
     the listening face showed up seconds after the wake word. Everywhere else
     it is a plain sleep.
     """
-    if not is_voice_screen:
-        time.sleep(seconds)
-        return
     deadline = time.time() + seconds
     while time.time() < deadline:
-        if str(CONFIG.get("voice_state", "idle") or "idle").lower() != "idle":
+        # An alarm lands on every screen, so unlike the voice state below this
+        # is not gated on being the voice screen. Sleeping through a second of
+        # it would stagger the flash across the three panels.
+        if ALARM["id"] is not None:
+            return
+        if is_voice_screen and (REMINDER["id"] is not None or
+                                str(CONFIG.get("voice_state", "idle") or "idle").lower() != "idle"):
             return
         time.sleep(0.05)
 
@@ -404,6 +642,44 @@ def screen_loop(panel, key):
                 except Exception: pass
                 time.sleep(0.3)
                 continue
+
+        # --- ALARM OVERRIDE: outranks everything, on every screen ---
+        # Ahead of the voice block deliberately: if an alarm goes off while Byte
+        # is mid-answer, the alarm is the thing that matters. Not limited to
+        # VOICE_SCREEN either — one small panel flashing is easy to sleep
+        # through, which is the entire failure mode of an alarm.
+        if ALARM["id"] is not None:
+            try:
+                img = widget_byte.render(
+                    "alarm",
+                    since=ALARM["since"],
+                    alarm_time=ALARM["time"],
+                    alarm_label=ALARM["label"],
+                    alarm_cap=ALARM_RING_CAP,
+                )
+                if img is not None:
+                    panel.show(img)
+                    time.sleep(0.3)          # flash cadence
+                    continue
+            except Exception as e:
+                print(f"[alarm] render failed: {e}")
+
+        # --- REMINDER: Byte says one thing, on the voice screen only ---
+        # Below the alarm and above the voice state. Reuses the 'speaking'
+        # renderer rather than adding a state, because a reminder is exactly what
+        # that renderer already draws: a short line of text, given the screen,
+        # for as long as it takes to read. And unlike an alarm it borrows one
+        # panel — it is worth noticing, not worth waking up for.
+        if is_voice_screen and REMINDER["id"] is not None:
+            try:
+                img = widget_byte.render("speaking", answer=REMINDER["text"],
+                                         since=REMINDER["since"])
+                if img is not None:
+                    panel.show(img)
+                    time.sleep(0.3)
+                    continue
+            except Exception as e:
+                print(f"[reminder] render failed: {e}")
 
         # --- VOICE OVERRIDE: Byte borrows this screen mid-interaction ---
         # voice_state arrives over the same SSE stream as the rest of CONFIG,
@@ -542,6 +818,7 @@ def main():
         threading.Thread(target=heartbeat_loop, daemon=True),
         threading.Thread(target=connectivity_loop, daemon=True),
         threading.Thread(target=calendar_loop, daemon=True),
+        threading.Thread(target=alarm_loop, daemon=True),
     ]
     for key, panel in panels: threads.append(threading.Thread(target=screen_loop, args=(panel, key), daemon=True))
     for t in threads: t.start()

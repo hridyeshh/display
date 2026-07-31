@@ -10,6 +10,21 @@ PIN_BTN = 26
 current_screen = 1
 bright = {1: 100, 2: 100, 3: 100}
 
+# While an alarm rings the encoder stops being a brightness knob: turn snoozes,
+# press dismisses. Hijacking it beats wiring a second input for something that
+# happens once a day, and losing brightness control for those few minutes is the
+# right trade — nobody is dimming a screen while an alarm goes off.
+#
+# main.py raises the flag and acts on the command; this file only writes it.
+ALARM_FILE = "/dev/shm/desky_alarm"
+ALARM_CMD_FILE = "/dev/shm/desky_alarm_cmd"
+
+def write_alarm_cmd(cmd):
+    try:
+        with open(ALARM_CMD_FILE, "w") as f:
+            f.write(cmd)
+    except Exception: pass
+
 def write_focus():
     try:
         with open("/dev/shm/desky_focus", "w") as f:
@@ -40,6 +55,25 @@ last_btn_ns = 0
 
 def cbf(chip, gpio, level, timestamp):
     global current_screen, last_a, last_btn_ns
+
+    # An alarm outranks the knob. Checked first and returned from, so none of the
+    # brightness or focus handling below runs while one is ringing.
+    if os.path.exists(ALARM_FILE):
+        if gpio == PIN_BTN and level == 0:
+            if timestamp - last_btn_ns < 250_000_000:
+                return
+            last_btn_ns = timestamp
+            write_alarm_cmd("dismiss")
+        elif gpio == PIN_A and level == 0:
+            # Direction is deliberately ignored: half the detents snoozing and
+            # half doing nothing is not what a hand reaching for a ringing alarm
+            # in the dark wants. Any turn snoozes.
+            #
+            # last_a still has to be maintained, or the rotation state machine
+            # below resumes mid-detent once the alarm stops.
+            last_a = level
+            write_alarm_cmd("snooze")
+        return
 
     # Handle Button Clicks (debounce ~250ms; timestamp is in nanoseconds)
     if gpio == PIN_BTN and level == 0:

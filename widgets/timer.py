@@ -1,84 +1,65 @@
 """
 desky widget — Countdown Timer
+240x320 RGB. Green TIMER label, VT323 hero MM:SS, the wall-clock time it ends,
+and a bar that depletes with the remaining time. Mirrors the `timer` state of
+DeskyPanel.
 """
 
-import os
-from PIL import Image, ImageDraw, ImageFont
+import time as _time
+from PIL import Image, ImageDraw
 
-W, H = 240, 320
-PAD  = 22
+from .theme import (
+    W, H, PAD, BG, FG, FG_MUTED, LINE, ACCENT_DONE, ACCENT_ERROR,
+    hero, label, bar,
+)
 
-BG           = (10, 10, 10)
-FG           = (242, 242, 242)
-FG_MUTED     = (107, 107, 107)
-LINE         = (34, 34, 34)
-ACCENT_GREEN = (122, 232, 153)
-RED          = (255, 59, 48)
-RED_DIM      = (90, 24, 20)
+# Byte's error red at a third brightness reads as "off" in the done-state flash.
+ERR_DARK = (142, 35, 41)
 
-FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fonts")
-
-def _font(name, size):
-    try: return ImageFont.truetype(os.path.join(FONT_DIR, f"{name}.ttf"), size)
-    except OSError: return ImageFont.load_default()
-
-def _tw(d, text, font): return d.textlength(text, font=font)
-
-def _time_row(d, cx, cy, mm, ss, accent):
-    f = _font("VT323-Regular", 78)
-    parts = [(mm, FG), (":", accent), (ss, FG)]
-    widths = [_tw(d, t, f) for t, _ in parts]
-    total  = sum(widths) + 2 * 2
-    x = cx - total / 2
-    for (t, fill), w in zip(parts, widths):
-        d.text((x, cy), t, font=f, fill=fill, anchor="lm")
-        x += w + 2
 
 def _fmt(secs):
     secs = max(0, int(secs))
-    return f"{secs // 60:02d}", f"{secs % 60:02d}"
+    return f"{secs // 60:02d}:{secs % 60:02d}"
+
 
 def render(remaining_sec, total_sec=None) -> Image.Image:
     img = Image.new("RGB", (W, H), BG)
-    d   = ImageDraw.Draw(img)
-    cx  = W // 2
+    d = ImageDraw.Draw(img)
 
-    f_lbl = _font("PressStart2P-Regular", 8)
+    f_lbl = label()
 
-    d.text((PAD, PAD + 4),      "TIMER",     font=f_lbl, fill=FG_MUTED,     anchor="la")
-    d.text((PAD, PAD + 18),     "COUNTDOWN", font=f_lbl, fill=FG_MUTED,     anchor="la")
-    d.text((W - PAD, PAD + 6),  "CDN",       font=f_lbl, fill=ACCENT_GREEN, anchor="ra")
+    d.text((PAD, PAD + 4), "TIMER", font=f_lbl, fill=ACCENT_DONE, anchor="la")
 
     cy = 150
-    mm, ss = _fmt(remaining_sec)
-    _time_row(d, cx, cy, mm, ss, ACCENT_GREEN)
+    d.text((W // 2, cy), _fmt(remaining_sec), font=hero(72), fill=FG, anchor="mm")
 
-    d.text((cx, cy + 50), "REMAINING", font=f_lbl, fill=FG_MUTED, anchor="mm")
+    ends = _time.strftime("%H:%M", _time.localtime(_time.time() + max(0, remaining_sec)))
+    d.text((W // 2, cy + 50), f"ENDS {ends}", font=f_lbl, fill=FG_MUTED, anchor="mm")
 
-    by = H - PAD
-    d.rectangle([PAD, by - 1, W - PAD, by + 1], fill=LINE)
-    if total_sec and total_sec > 0:
-        elapsed = max(0, total_sec - remaining_sec)
-        frac    = min(1.0, elapsed / total_sec)
-        if frac > 0:
-            d.rectangle([PAD, by - 1, PAD + int((W - 2 * PAD) * frac), by + 1], fill=ACCENT_GREEN)
-
+    frac = (max(0, remaining_sec) / total_sec) if total_sec and total_sec > 0 else 0.0
+    bar(d, PAD, H - PAD - 3, W - 2 * PAD, frac, ACCENT_DONE)
     return img
+
 
 def render_done(flash_on=True) -> Image.Image:
     img = Image.new("RGB", (W, H), BG)
-    d   = ImageDraw.Draw(img)
-    cx  = W // 2
-    f_lbl = _font("PressStart2P-Regular", 8)
+    d = ImageDraw.Draw(img)
+    color = ACCENT_ERROR if flash_on else ERR_DARK
 
-    d.text((PAD, PAD + 4), "TIMER", font=f_lbl, fill=FG_MUTED, anchor="la")
+    d.text((PAD, PAD + 4), "TIMER", font=label(), fill=color, anchor="la")
 
     cy = 150
-    _time_row(d, cx, cy, "00", "00", LINE)
+    d.text((W // 2, cy), "00:00", font=hero(72), fill=LINE, anchor="mm")
+    d.text((W // 2, cy + 50), "TIME'S UP", font=label(10), fill=color, anchor="mm")
 
-    color = RED if flash_on else RED_DIM
-    d.text((cx, cy + 50), "TIME'S UP", font=_font("PressStart2P-Regular", 10), fill=color, anchor="mm")
-
-    by = H - PAD
-    d.rectangle([PAD, by - 1, W - PAD, by + 1], fill=RED if flash_on else RED_DIM)
+    d.rectangle([PAD, H - PAD - 3, W - PAD, H - PAD - 1], fill=color)
     return img
+
+
+if __name__ == "__main__":
+    # ponytail: the bar fraction is the only branch worth pinning down.
+    render(1500, 1500).save("out_timer_full.png")
+    render(90, 1500).save("out_timer_low.png")
+    render(0, None).save("out_timer_zero.png")
+    render_done(True).save("out_timer_done.png")
+    print("wrote out_timer_*.png")

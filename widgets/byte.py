@@ -26,6 +26,8 @@ ACCENT_AI    = (164, 122, 232)  # #A47AE8  voice assistant purple
 AI_DARK      = (110, 79, 160)   # #6E4FA0  Byte's shadow shell
 ACCENT_ERROR = (252, 60, 68)    # #FC3C44  error red
 ERR_DARK     = (142, 35, 41)    # #8E2329  Byte's shadow shell (error)
+ACCENT_ALARM = (232, 201, 122)  # #E8C97A  alarm amber (design system --accent-warm)
+ALARM_DARK   = (150, 128, 78)   # #96804E  Byte's shadow shell (alarm)
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "fonts")
 
@@ -129,8 +131,13 @@ def _canvas():
 def byte_rects(state, f=0):
     """[(x, y, w, h, color), ...] in 16x16 grid units. Mirror of ai-sprite.js."""
     err = state == "error"
-    shell = ACCENT_ERROR if err else ACCENT_AI
-    dark = ERR_DARK if err else AI_DARK
+    alarm = state == "alarm"
+    if err:
+        shell, dark = ACCENT_ERROR, ERR_DARK
+    elif alarm:
+        shell, dark = ACCENT_ALARM, ALARM_DARK
+    else:
+        shell, dark = ACCENT_AI, AI_DARK
     r = []
 
     # antenna — pulses while listening, blinks while thinking
@@ -138,6 +145,11 @@ def byte_rects(state, f=0):
         r.append((6, 0, 4, 2, shell) if f % 2 == 0 else (7, 0, 2, 2, shell))
     elif state == "thinking":
         r.append((7, 0, 2, 2, shell if f % 4 == 0 else dark))
+    elif alarm:
+        # The widest swing of any state, on every frame rather than every other
+        # one: this is the Byte that has to be noticed from across a dark room
+        # while asleep, not read up close.
+        r.append((4, 0, 8, 2, shell) if f % 2 == 0 else (7, 0, 2, 2, shell))
     else:
         r.append((7, 0, 2, 2, dark if err else shell))
     r.append((7, 2, 2, 3, dark))
@@ -160,7 +172,7 @@ def byte_rects(state, f=0):
 
     if err:                                               # frown
         r += [(5, 14, 2, 1, BG), (7, 15, 2, 1, BG), (9, 14, 2, 1, BG)]
-    elif state == "speaking":                             # mouth bar opens
+    elif state in ("speaking", "alarm"):                  # mouth bar opens
         r.append((5, 14, 6, [1, 2, 2, 1, 2, 1][f % 6], BG))
     elif state == "thinking":
         r.append((7, 14, 2, 1, BG))
@@ -307,10 +319,73 @@ def render_byte_error(attempt=None, attempts=3, countdown=1.0):
     return img
 
 
+def _swap(rects, mapping):
+    """Recolour a rect list. Used to invert Byte for the alarm flash.
+
+    A plain image invert would do something else entirely — inverting amber
+    gives blue — so the two colours that carry the state are exchanged by name
+    instead. The lookup reads the original colour of each rect, so a mapping
+    that swaps two colours both ways does not cascade.
+    """
+    return [(x, y, w, h, mapping.get(c, c)) for x, y, w, h, c in rects]
+
+
+def render_byte_alarm(alarm_time="", label="", countdown=1.0):
+    """An alarm is ringing: the whole screen flashes and Byte shouts.
+
+    Deliberately not the 'speaking' renderer, which shrinks Byte to a corner
+    sprite and gives the screen to answer text — the opposite of what this needs.
+    Every other state is something to read; this one is something to notice.
+
+    countdown is how much of the ring cap remains, drawn as the bottom bar. It
+    is the honest thing to show: nothing here can promise a dismiss, so what the
+    bar says is when the noise stops on its own.
+    """
+    f = _frame()
+    flash = f % 2 == 0
+    bg = ACCENT_ALARM if flash else BG
+    fg = BG if flash else FG
+    muted = ALARM_DARK if flash else FG_MUTED
+
+    img = Image.new("RGB", (W, H), bg)
+    d = ImageDraw.Draw(img)
+
+    tracked(d, (PAD - 4, 16), "DESKY", _FONTS["label"], muted, tracking=1)
+    tracked(d, (PAD - 4, 30), "ALARM", _FONTS["label"], muted, tracking=1)
+    tracked(d, (W - PAD + 4, 16), "RINGING", _FONTS["label"], fg, tracking=1, anchor="ra")
+
+    rects = byte_rects("alarm", f)
+    if flash:
+        # Byte goes dark on the lit frame: the shell takes the background colour
+        # and the visor takes the accent, so the two frames are true opposites.
+        rects = _swap(rects, {ACCENT_ALARM: BG, ALARM_DARK: BG, BG: ACCENT_ALARM, FG: BG})
+    p, ox, oy = 5, (W - 16 * 5) // 2, 52
+    for x, y, w, h, col in rects:
+        d.rectangle([ox + x * p, oy + y * p, ox + (x + w) * p - 1, oy + (y + h) * p - 1], fill=col)
+
+    # The time is the point of the screen, so it gets the hero font.
+    tracked(d, (W // 2, 150), str(alarm_time), _FONTS["hero"], fg, tracking=2, anchor="ma")
+
+    y = 214
+    for ln in _wrap(d, str(label).upper(), _FONTS["body"], W - 2 * (PAD - 4), tracking=1, max_lines=2):
+        tracked(d, (W // 2, y), ln, _FONTS["body"], fg, tracking=1, anchor="ma")
+        y += 16
+
+    tracked(d, (W // 2, 268), "STOP IT FROM", _FONTS["label"], muted, tracking=1, anchor="ma")
+    tracked(d, (W // 2, 280), "THE DESKY APP", _FONTS["label"], muted, tracking=1, anchor="ma")
+
+    d.rectangle([PAD, H - PAD - 4, W - PAD, H - PAD], fill=muted)
+    pct = max(0.0, min(1.0, float(countdown)))
+    if pct > 0:
+        d.rectangle([PAD, H - PAD - 4, PAD + int((W - 2 * PAD) * pct), H - PAD], fill=fg)
+    return img
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher used by main.py
 # ---------------------------------------------------------------------------
-def render(state, question="", answer="", since=None, attempt=None, source=None):
+def render(state, question="", answer="", since=None, attempt=None, source=None,
+           alarm_time="", alarm_label="", alarm_cap=600):
     """Render whichever Byte state the backend reports.
 
     `since` is the epoch seconds of the last state change, used for the elapsed
@@ -319,6 +394,11 @@ def render(state, question="", answer="", since=None, attempt=None, source=None)
     """
     state = (state or "idle").lower()
     elapsed = (time.time() - since) if since else None
+    if state == "alarm":
+        # Ahead of every other state: an alarm outranks whatever Byte was in the
+        # middle of saying.
+        remaining = 1.0 if elapsed is None else max(0.0, 1.0 - elapsed / float(alarm_cap))
+        return render_byte_alarm(alarm_time, alarm_label, countdown=remaining)
     if state == "listening":
         # Decorative level: this device has no mic input wired yet.
         return render_byte_listening(level=6 + int(abs(math.sin(_frame() * 0.5)) * 6))
@@ -339,6 +419,25 @@ if __name__ == "__main__":
     for st in ("listening", "thinking", "speaking", "answered", "error"):
         img = render(st, question="what is 2+2", answer="4", since=time.time() - 3)
         assert img is not None and img.size == (W, H), st
+
+    # The alarm has to render on both halves of its flash, and the two frames
+    # must actually differ — a flash that draws the same pixels twice is just a
+    # static screen with extra steps.
+    _a = render_byte_alarm("07:00", "WAKE UP", countdown=1.0)
+    assert _a.size == (W, H)
+    _lit = _swap(byte_rects("alarm", 0), {ACCENT_ALARM: BG, BG: ACCENT_ALARM})
+    assert _lit != byte_rects("alarm", 0), "flash frame is identical to the dark one"
+    # Alarm must not borrow the voice accent: purple means Byte is answering, and
+    # an alarm is not an answer.
+    assert all(c != ACCENT_AI for _x, _y, _w, _h, c in byte_rects("alarm", 0))
+    # The countdown bar is a fraction; out-of-range values clamp rather than draw
+    # off-canvas or raise.
+    for _c in (-1.0, 0.0, 0.5, 1.0, 2.0):
+        assert render_byte_alarm("07:00", "WAKE UP", countdown=_c).size == (W, H)
+    # Dispatcher routes it, and a missing label or time still renders.
+    assert render("alarm", alarm_time="07:00", alarm_label="WAKE UP",
+                  since=time.time() - 3) is not None
+    assert render("alarm") is not None
     # Wrapping must never exceed the drawn width or drop the max_lines cap.
     _img, _d = _canvas()
     _lines = _wrap(_d, "A" * 400, _FONTS["body"], 100, tracking=1, max_lines=4)
@@ -352,4 +451,10 @@ if __name__ == "__main__":
         "leading gains while banking drags the index down.",
         elapsed=6, source="web search").save("out_byte_speaking_long.png")
     render_byte_error(attempt=2, countdown=0.6).save("out_byte_error.png")
+    # Both halves of the flash. The frame comes off the wall clock so that every
+    # render is self-contained, which means the only way to catch the other one
+    # is to wait for it.
+    render_byte_alarm("07:00", "WAKE UP", countdown=0.7).save("out_byte_alarm_a.png")
+    time.sleep(FRAME_MS)
+    render_byte_alarm("07:00", "WAKE UP", countdown=0.7).save("out_byte_alarm_b.png")
     print("ok — wrote out_byte_*.png")

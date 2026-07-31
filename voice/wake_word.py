@@ -307,12 +307,24 @@ def send_audio(path):
         speak(answer)
 
 
-def speak(text):
-    """Say the answer out loud.
+def _play(wav):
+    """Push a complete WAV at the speaker. Returns whether it played.
 
-    The server returns WAV, header and all, so aplay reads the sample rate off
-    the stream — the Pi never has to agree with the server about a format.
+    aplay reads the sample rate off the stream's own header, so the Pi never has
+    to agree with the server about a format. Failure is reported rather than
+    raised: both callers are on threads where an exception would take down more
+    than the sound.
     """
+    p = subprocess.run(["aplay", "-D", SPEAKER_DEVICE, "-q", "-"],
+                       input=wav, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        log(f"aplay failed: {p.stderr.decode(errors='replace')[:160]}")
+        return False
+    return True
+
+
+def speak(text):
+    """Say the answer out loud."""
     try:
         r = requests.post(SPEECH_URL, json={"text": text}, timeout=60)
         if r.status_code != 200:
@@ -321,14 +333,184 @@ def speak(text):
         # Playback runs while the loop keeps listening, so Desky can be
         # interrupted by another wake word mid-sentence. The mic will also hear
         # this audio; harmless today because we only record after a trigger.
-        p = subprocess.run(["aplay", "-D", SPEAKER_DEVICE, "-q", "-"],
-                           input=r.content, stderr=subprocess.PIPE)
-        if p.returncode != 0:
-            log(f"aplay failed: {p.stderr.decode(errors='replace')[:160]}")
-        else:
+        if _play(r.content):
             log(f"spoke {len(r.content)} bytes")
     except Exception as e:
         log(f"speak failed: {e}")
+
+
+# --- Alarms ---------------------------------------------------------------
+# main.py decides when an alarm fires — it holds the schedule and watches the
+# clock — but it has never touched audio, and this process owns the speaker. The
+# handoff is the same /dev/shm flag file the encoder already uses for focus and
+# brightness: its existence means "ringing", its removal means "stop". One
+# writer each way, and no third thing opening the ALSA device.
+
+ALARM_FILE = "/dev/shm/desky_alarm"
+
+# Gap between repeats. Long enough to be a repeating alarm rather than a wall of
+# noise, short enough that the silence never reads as "it stopped".
+ALARM_REPEAT_SEC = 8.0
+
+# The fallback tone, for when the network or the TTS quota is gone.
+ALARM_BEEP_HZ = 880
+ALARM_BEEP_SEC = 1.2
+ALARM_BEEP_AMPLITUDE = 8000
+
+_BEEP = None
+
+
+def beep_wav():
+    """A pulsed square wave, built here rather than shipped as a file.
+
+    This is the whole reason the alarm cannot fail silently. The spoken wake
+    message needs the network and Groq's TTS quota, and that quota is ~3600
+    tokens a day — running dry is an ordinary Tuesday, not an outage. An alarm
+    that says nothing because of it would be the worst bug this feature could
+    have, so there is always something to fall back to that needs neither.
+    """
+    global _BEEP
+    if _BEEP is None:
+        t = np.arange(int(SAMPLE_RATE * ALARM_BEEP_SEC))
+        # Square, not sine: it carries further through a small speaker, and the
+        # harmonics are what make it sound like an alarm rather than a tone.
+        tone = np.where(np.sin(2 * np.pi * ALARM_BEEP_HZ * t / SAMPLE_RATE) >= 0,
+                        ALARM_BEEP_AMPLITUDE, -ALARM_BEEP_AMPLITUDE)
+        # Chopped into bursts. A continuous tone is easy to stop hearing.
+        pulses = ((t // (SAMPLE_RATE // 8)) % 2 == 0)
+        samples = (tone * pulses).astype(np.int16)
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(samples.tobytes())
+        _BEEP = buf.getvalue()
+    return _BEEP
+
+
+def alarm_label():
+    """The label of the ringing alarm, or "" — the flag holds "<id> <label>"."""
+    try:
+        with open(ALARM_FILE) as f:
+            parts = f.read().strip().split(" ", 1)
+        return parts[1].strip() if len(parts) > 1 else ""
+    except Exception:
+        return ""
+
+
+def alarm_audio(label):
+    """The audio for this ring, fetched once and reused for every repeat.
+
+    Once, not per repeat: re-synthesising every eight seconds would spend the
+    daily TTS quota inside a couple of minutes and then start failing partway
+    through — the alarm would get quieter the longer nobody answered it, which
+    is precisely backwards.
+    """
+    text = f"{label}." if label else "Wake up."
+    try:
+        r = requests.post(SPEECH_URL, json={"text": text}, timeout=30)
+        if r.status_code == 200 and r.content:
+            log(f"alarm audio: {len(r.content)} bytes of speech")
+            return r.content
+        log(f"alarm speech -> {r.status_code}: {r.text[:120]} — falling back to the beep")
+    except Exception as e:
+        log(f"alarm speech failed ({e}) — falling back to the beep")
+    return beep_wav()
+
+
+# A reminder is the other half of the same handoff: main.py writes the text, this
+# speaks it. Twice rather than once, because one utterance is easy to miss if you
+# are not at the desk — and twice is still nothing like an alarm, since it ends
+# whether or not anybody heard it.
+REMINDER_FILE = "/dev/shm/desky_reminder"
+REMINDER_REPEATS = 2
+REMINDER_GAP_SEC = 5.0
+
+
+def speak_reminder():
+    """Say the reminder twice, then drop the flag. Blocking, by design.
+
+    Runs on the alarm watcher's thread, so a reminder cannot overlap a ring or
+    another reminder — one speaker, one thing talking at a time.
+    """
+    try:
+        with open(REMINDER_FILE) as f:
+            text = f.read().strip()
+    except Exception:
+        text = ""
+
+    if text:
+        # Fetched once and replayed, for the same reason the alarm does it: the
+        # daily TTS quota is small, and the second utterance is usually the one
+        # actually heard.
+        audio = None
+        try:
+            r = requests.post(SPEECH_URL, json={"text": f"Reminder: {text}."}, timeout=30)
+            if r.status_code == 200 and r.content:
+                audio = r.content
+            else:
+                log(f"reminder speech -> {r.status_code}: {r.text[:120]}")
+        except Exception as e:
+            log(f"reminder speech failed: {e}")
+
+        if audio:
+            for i in range(REMINDER_REPEATS):
+                if i:
+                    time.sleep(REMINDER_GAP_SEC)
+                _play(audio)
+            log(f"spoke reminder twice: {text!r}")
+        else:
+            # No beep fallback here, unlike an alarm. A beep that means "you were
+            # reminded of something, but not what" is worse than silence, and
+            # main.py is still showing the text on screen — which is the honest
+            # remainder of the feature.
+            log(f"reminder {text!r} shown but not spoken")
+
+    try:
+        os.remove(REMINDER_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log(f"could not remove {REMINDER_FILE}: {e}")
+
+
+def alarm_watch_loop():
+    """Ring while the alarm flag is up, and speak reminders as they appear.
+
+    Both live on this thread because both end in aplay and the speaker takes one
+    at a time. An alarm wins: a reminder arriving mid-ring waits for the flag to
+    drop, which is the right order — the ringing thing is the urgent one.
+    """
+    audio = None
+    last = 0.0
+    while True:
+        try:
+            if not os.path.exists(ALARM_FILE):
+                # Dropped between repeats: forget the audio, so the next ring
+                # fetches against its own label rather than the last one's.
+                audio = None
+                if os.path.exists(REMINDER_FILE):
+                    speak_reminder()
+                    continue
+                time.sleep(0.5)
+                continue
+
+            if audio is None:
+                audio = alarm_audio(alarm_label())
+                last = 0.0                      # ring now, then on the gap
+
+            if time.monotonic() - last >= ALARM_REPEAT_SEC:
+                last = time.monotonic()
+                # A failure here is usually the voice loop holding the speaker
+                # mid-answer. Not worth handling: the next repeat is eight
+                # seconds away and that answer will be over by then.
+                _play(audio)
+        except Exception as e:
+            log(f"alarm loop: {e}")
+            time.sleep(1.0)
+        time.sleep(0.25)
 
 
 def save_wav(frames):
@@ -380,6 +562,12 @@ def listen_forever():
     preroll = deque(maxlen=max(1, int(PREROLL_SEC / FRAME_SEC)))
     last_fire = 0.0
     last_near_miss = 0.0
+
+    # Rings alarms main.py has decided are due. Its own thread because it spends
+    # most of its life blocked in aplay, and the detection loop below cannot
+    # afford to wait on that — a blocked read backs up arecord's pipe and every
+    # wake word after it lands late.
+    threading.Thread(target=alarm_watch_loop, daemon=True).start()
 
     proc = open_mic()
     log(f"listening on {MIC_DEVICE} (threshold {DETECTION_THRESHOLD}, gain {MIC_GAIN})")
@@ -537,6 +725,64 @@ def selftest():
         assert abs(rms(read_frame(FakeProc(faint))) - 1500) < 1.0
     finally:
         MIC_GAIN = original_gain
+
+    # The alarm fallback has to be a WAV aplay will actually take, and it has to
+    # be audible — a silent buffer would "work" everywhere except the one moment
+    # it exists for.
+    raw = beep_wav()
+    assert raw[:4] == b"RIFF" and raw[8:12] == b"WAVE", raw[:12]
+    with wave.open(io.BytesIO(raw)) as w:
+        assert w.getnchannels() == 1 and w.getsampwidth() == 2
+        assert w.getframerate() == SAMPLE_RATE
+        beep = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+    assert len(beep) == int(SAMPLE_RATE * ALARM_BEEP_SEC), len(beep)
+    assert rms(beep) > 1000, f"beep is too quiet to wake anyone: rms {rms(beep):.0f}"
+    assert beep.min() < 0 < beep.max(), "beep never leaves zero"
+    # Pulsed, not continuous: there must be silence in there somewhere.
+    assert (beep == 0).any(), "beep is a solid tone, not bursts"
+    assert beep_wav() is raw, "beep rebuilt instead of being cached"
+
+    # The flag file carries "<id> <label>", and every part of it is optional
+    # except the id — a label with spaces must survive intact.
+    import tempfile
+    global ALARM_FILE
+    _real_flag, tmpdir = ALARM_FILE, tempfile.mkdtemp()
+    ALARM_FILE = str(Path(tmpdir) / "desky_alarm")
+    try:
+        assert alarm_label() == "", "missing flag file should read as no label"
+        for written, want in (("1 WAKE UP", "WAKE UP"), ("2 CHECK THE OVEN", "CHECK THE OVEN"),
+                              ("3", ""), ("4  ", ""), ("5 x", "x")):
+            Path(ALARM_FILE).write_text(written)
+            assert alarm_label() == want, f"{written!r} -> {alarm_label()!r}, want {want!r}"
+    finally:
+        ALARM_FILE = _real_flag
+
+    # A reminder must not leave its flag behind, or main.py's screen state and
+    # this process disagree about whether it has been said. The path worth
+    # pinning is the one with no speech available: it still has to clean up, and
+    # it must not fall back to the alarm's beep — a noise that means "you were
+    # reminded of something, but not what" is worse than silence.
+    #
+    # Kept off the network and off the speaker: SPEECH_URL points at a closed
+    # port so the request fails at once, and _play is stubbed because aplay does
+    # not exist on a dev machine.
+    _real = (REMINDER_FILE, SPEECH_URL, _play)
+    played = []
+    globals()["REMINDER_FILE"] = str(Path(tempfile.mkdtemp()) / "desky_reminder")
+    globals()["SPEECH_URL"] = "http://127.0.0.1:1/refused"
+    globals()["_play"] = lambda wav: played.append(wav) or True
+    try:
+        Path(REMINDER_FILE).write_text("do laundry")
+        speak_reminder()
+        assert not Path(REMINDER_FILE).exists(), "reminder flag survived being spoken"
+        assert played == [], "a reminder with no speech still made a noise"
+        # An empty flag is still consumed, or it would be retried forever.
+        Path(REMINDER_FILE).write_text("")
+        speak_reminder()
+        assert not Path(REMINDER_FILE).exists(), "empty reminder flag was left behind"
+        assert played == []
+    finally:
+        globals()["REMINDER_FILE"], globals()["SPEECH_URL"], globals()["_play"] = _real
 
     assert Path(find_model()).exists()
 
