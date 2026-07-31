@@ -237,6 +237,56 @@ def notify_listening():
         log(f"POST /voice/listening failed: {e}")
 
 
+# Set when the phone asks the desk to listen. An Event rather than a flag
+# because the SSE thread sets it and the detection loop clears it, and this is
+# the one piece of state those two share.
+REMOTE_TRIGGER = threading.Event()
+
+# The server stamps a nonce on each trigger, and that is what gets watched
+# rather than the 'listening' state: the row is already listening by the second
+# tap, so the state alone would never change again.
+EVENTS_URL = BACKEND + "/events"
+
+
+def remote_trigger_loop():
+    """Watch the SSE stream for the phone's listen button.
+
+    Its own connection rather than a hook into main.py's: that runs in a
+    different process, and a pipe between them to carry one integer would be
+    more moving parts than a second reader of a stream the server already
+    fans out to everyone.
+    """
+    last = None
+    while True:
+        try:
+            with requests.get(EVENTS_URL, stream=True, timeout=(5, 60)) as resp:
+                if resp.status_code != 200:
+                    raise RuntimeError(f"status {resp.status_code}")
+                for raw in resp.iter_lines(chunk_size=1, decode_unicode=True):
+                    if not raw or raw.startswith(":") or not raw.startswith("data:"):
+                        continue
+                    try:
+                        data = json.loads(raw[len("data:"):].strip() or "{}")
+                    except ValueError:
+                        continue
+                    nonce = data.get("voice_trigger")
+                    if nonce is None:
+                        continue
+                    # The first one seen after a connect may be a replay of
+                    # something hours old. Adopting it silently is what stops a
+                    # restart from recording an empty room.
+                    if last is None:
+                        last = nonce
+                        continue
+                    if nonce != last:
+                        last = nonce
+                        log("remote trigger from the app")
+                        REMOTE_TRIGGER.set()
+        except Exception as e:
+            log(f"trigger stream: {e}")
+        time.sleep(3)
+
+
 def notify_error():
     """Put Byte in the error state for a failure only this end can see.
 
@@ -568,6 +618,7 @@ def listen_forever():
     # afford to wait on that — a blocked read backs up arecord's pipe and every
     # wake word after it lands late.
     threading.Thread(target=alarm_watch_loop, daemon=True).start()
+    threading.Thread(target=remote_trigger_loop, daemon=True).start()
 
     proc = open_mic()
     log(f"listening on {MIC_DEVICE} (threshold {DETECTION_THRESHOLD}, gain {MIC_GAIN})")
@@ -601,26 +652,37 @@ def listen_forever():
                     started = time.monotonic()
                     continue
 
-            score = oww.predict(frame).get(label, 0.0)
-            if score < DETECTION_THRESHOLD:
-                # A miss is otherwise invisible, which makes "it only hears one
-                # tone" impossible to act on: a 0.45 means the threshold is too
-                # high, a 0.05 means the model does not know that delivery at
-                # all and no threshold will help. Rate-limited so a noisy room
-                # cannot flood the journal.
-                if score >= NEAR_MISS_SCORE and time.monotonic() - last_near_miss > 1.0:
-                    last_near_miss = time.monotonic()
-                    log(f"near miss: {score:.3f}")
-                continue
-            if time.monotonic() - last_fire < COOLDOWN_SEC:
-                continue
+            # A tap on the phone enters here rather than through the model, and
+            # then takes exactly the same path: record until silence, upload,
+            # answer. Checked before predict() because it costs nothing and the
+            # tap should not wait on a frame that was going to miss anyway.
+            if REMOTE_TRIGGER.is_set():
+                REMOTE_TRIGGER.clear()
+                last_fire = time.monotonic()
+                # No notify_listening: the endpoint that set this flag already
+                # put the row in 'listening', and posting again would only
+                # re-broadcast a state the screen is showing.
+            else:
+                score = oww.predict(frame).get(label, 0.0)
+                if score < DETECTION_THRESHOLD:
+                    # A miss is otherwise invisible, which makes "it only hears
+                    # one tone" impossible to act on: a 0.45 means the threshold
+                    # is too high, a 0.05 means the model does not know that
+                    # delivery at all and no threshold will help. Rate-limited
+                    # so a noisy room cannot flood the journal.
+                    if score >= NEAR_MISS_SCORE and time.monotonic() - last_near_miss > 1.0:
+                        last_near_miss = time.monotonic()
+                        log(f"near miss: {score:.3f}")
+                    continue
+                if time.monotonic() - last_fire < COOLDOWN_SEC:
+                    continue
 
-            last_fire = time.monotonic()
-            log(f"wake word detected, confidence: {score:.3f}")
+                last_fire = time.monotonic()
+                log(f"wake word detected, confidence: {score:.3f}")
 
-            # Fire-and-forget so a slow Railway round trip does not eat the
-            # start of the question.
-            threading.Thread(target=notify_listening, daemon=True).start()
+                # Fire-and-forget so a slow Railway round trip does not eat the
+                # start of the question.
+                threading.Thread(target=notify_listening, daemon=True).start()
 
             frames = record(proc, preroll)
             path = save_wav(frames)

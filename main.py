@@ -36,6 +36,9 @@ import widgets.calendar as widget_calendar
 import widgets.quote as widget_quote
 import widgets.pet as widget_pet
 import widgets.byte as widget_byte
+# The bulb executor, shared with the voice loop. Only this end can reach the
+# lamp — it takes UDP on this LAN, and the backend is not on it.
+from voice.light import apply_action as bulb_apply_action
 
 WIDGETS = {
     "clock":   widget_clock.render,
@@ -247,13 +250,33 @@ class DisplayPanel:
 
 _GIF_KEY = {"screen1": "gif_url_1", "screen2": "gif_url_2", "screen3": "gif_url_3"}
 
+def _run_bulb_action(action):
+    """Carry out a bulb command the backend sent over SSE.
+
+    This end is the only one that can: the bulb takes UDP on this LAN and
+    Railway is not on it. Off-thread because a bulb that has been unplugged
+    costs light.py its full 2s reply timeout, and the SSE reader must not sit
+    that out — the next config event would land two seconds late.
+    """
+    try:
+        ok, reason, _ = bulb_apply_action(action)
+        if not ok:
+            print(f"[bulb] {reason}")
+    except Exception as e:
+        print(f"[bulb] error: {e}")
+
 def _apply_event_data(payload):
     payload = payload.strip()
     if not payload: return
     try:
         data = json.loads(payload)
+        # Pulled out before the merge: it is a command, not state, and leaving
+        # it in CONFIG would strand a stale one there to be re-read forever.
+        action = data.pop("bulb_action", None)
         CONFIG.update(data)
         if "brightness" in data: set_brightness(data["brightness"])
+        if action is not None:
+            threading.Thread(target=_run_bulb_action, args=(action,), daemon=True).start()
     except Exception as e:
         print(f"[sse] error applying event: {e}")
 
