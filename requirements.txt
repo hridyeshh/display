@@ -1,5 +1,8 @@
 numpy
-openwakeword
+onnxruntime
+scipy
+scikit-learn
+tqdm
 Pillow
 requests
 spidev
