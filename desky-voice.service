@@ -4,9 +4,9 @@ After=network-online.target sound.target
 Wants=network-online.target
 
 [Service]
-# System python, matching the desky unit as actually installed on the Pi.
-# There is no .venv there; deps go in with --break-system-packages.
-ExecStart=/usr/bin/python3 /home/hridyesh/display/voice/wake_word.py
+# The venv setup.sh builds, same interpreter as the desky unit. System python
+# has none of the deps, and openwakeword has no aarch64/py3.13 wheel outside it.
+ExecStart=/home/hridyesh/display/.venv/bin/python /home/hridyesh/display/voice/wake_word.py
 WorkingDirectory=/home/hridyesh/display/voice
 Restart=always
 RestartSec=5

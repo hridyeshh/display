@@ -1,4 +1,5 @@
 numpy
+openwakeword
 Pillow
 requests
 spidev
