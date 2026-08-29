@@ -69,6 +69,9 @@ DETECTION_THRESHOLD = 0.4
 # readable — put it back afterwards.
 NEAR_MISS_SCORE = 0.15
 
+# Near-miss clips are saved too — see the NEAR_MISS_* block below FRAME_SEC,
+# which is where they live because the frame counts are derived from it.
+
 # Ignore further hits right after one fires. Without this the tail of the
 # wake word re-triggers the model while we are already recording.
 COOLDOWN_SEC = 3.0
@@ -141,6 +144,43 @@ FRAME_SEC = FRAME_SAMPLES / SAMPLE_RATE
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 RECORDINGS_DIR = SCRIPT_DIR / "recordings"
+
+# --- near-miss capture ----------------------------------------------------
+# A near miss is only actionable as audio. The score alone says the model was
+# unsure; the clip says whether it was unsure about "hey desky" or about a chair
+# scraping — and only the first kind is worth retraining on.
+#
+# Its own buffer rather than preroll's. That one holds 0.48s and feeds straight
+# into the question recording, so growing it to cover the ~1.3s melspectrogram
+# window openWakeWord actually scores would also push the wake word itself into
+# every upload and leave Whisper transcribing it.
+#
+# Outside the repo on purpose: this is local training data, not code, and
+# ~/display is a working tree that gets `git reset --hard` on every deploy.
+NEAR_MISS_DIR = Path.home() / "wakeword-near-misses"
+NEAR_MISS_SEC = 2.0
+NEAR_MISS_FRAMES = int(NEAR_MISS_SEC / FRAME_SEC)
+
+# Frames to keep buffering past the crossing before dumping. The score ramps as
+# the word completes, so dumping the instant it clears NEAR_MISS_SCORE files the
+# run-up and cuts off the half that matters. ~1s of tail centres the clip.
+NEAR_MISS_TAIL_FRAMES = int(1.0 / FRAME_SEC)
+
+# Gap between saved clips, deliberately >= NEAR_MISS_SEC. That inequality is the
+# whole guard: two clips saved a buffer-length apart cannot share a sample, so
+# they can neither duplicate each other in the training set nor collide on a
+# filename, which is stamped to the second and would silently overwrite.
+#
+# Separate from the 1.0s rate limit on the near-miss log line. Those are
+# different questions — how often to write a journal line, and how often to keep
+# two seconds of audio — and tying them together is what makes a diagnostic run
+# that lowers one quietly break the other.
+NEAR_MISS_COOLDOWN_SEC = NEAR_MISS_SEC
+
+# Ceiling on stored clips, oldest deleted first. 2s of 16 kHz mono is 64 KB, so
+# the directory tops out around 32 MB — months of misses on a 29 GB card, and it
+# cannot creep past that while nobody is looking.
+NEAR_MISS_KEEP = 500
 
 
 def log(msg):
@@ -644,6 +684,37 @@ def save_wav(frames):
     return path
 
 
+def save_near_miss(frames, score):
+    """Write one near-miss clip. Called on a thread — never from the loop.
+
+    64 KB is nothing, but the loop's whole budget is 80 ms a frame with
+    predict() already taking 55 of it. Off-thread means an SD card having a bad
+    moment shows up as a late clip rather than a dropped wake word.
+    """
+    try:
+        NEAR_MISS_DIR.mkdir(exist_ok=True)
+        path = NEAR_MISS_DIR / f"{datetime.now():%Y%m%d_%H%M%S}_{score:.3f}.wav"
+        with wave.open(str(path), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SAMPLE_RATE)
+            w.writeframes(np.concatenate(frames).tobytes())
+
+        # Oldest first, by the timestamp the name starts with. Non-recursive, so
+        # clips already moved into verified/ are out of the cap's reach — a
+        # reviewed batch cannot be thrown away by a noisy afternoon.
+        old = sorted(NEAR_MISS_DIR.glob("*.wav"))[:-NEAR_MISS_KEEP]
+        for p in old:
+            # NEAR_MISS_COOLDOWN_SEC should mean only one of these runs at a
+            # time, but losing a clip to a misleading "save failed" line if that
+            # ever stops holding is not a trade worth making.
+            p.unlink(missing_ok=True)
+        if old:
+            log(f"near-miss cap: dropped {len(old)} oldest")
+    except Exception as e:
+        log(f"near-miss save failed: {e}")
+
+
 def record(proc, preroll, grace_sec=0.0):
     """Record until silence or MAX_RECORD_SEC, reusing the detection stream.
 
@@ -692,8 +763,15 @@ def listen_forever():
     oww = Model(wakeword_model_paths=[model_path])
 
     preroll = deque(maxlen=max(1, int(PREROLL_SEC / FRAME_SEC)))
+    # Longer than preroll, and never fed into a recording: this one exists only
+    # to be dumped when the model nearly fires.
+    history = deque(maxlen=NEAR_MISS_FRAMES)
     last_fire = 0.0
     last_near_miss = 0.0
+    last_capture = 0.0
+    # Frames still owed to an armed capture, and the best score seen since it was
+    # armed. pending == 0 means nothing is in flight.
+    pending, peak = 0, 0.0
 
     # Rings alarms main.py has decided are due. Its own thread because it spends
     # most of its life blocked in aplay, and the detection loop below cannot
@@ -718,6 +796,7 @@ def listen_forever():
                 # let systemd's Restart=always retry until it comes back.
                 raise SystemExit(f"arecord stopped on {MIC_DEVICE}")
             preroll.append(frame)
+            history.append(frame)
 
             frames_seen += 1
             if frames_seen % 25 == 0:  # ~2s of audio
@@ -729,6 +808,11 @@ def listen_forever():
                     secs = drain(proc)
                     log(f"behind live audio by {lag:.1f}s — dropped {secs:.1f}s of stale audio")
                     preroll.clear()
+                    # An armed capture cannot survive a drop: its buffer would be
+                    # stitched from either side of the gap, which is a clip of
+                    # something nobody said.
+                    history.clear()
+                    pending = 0
                     oww.reset()
                     frames_seen = 0
                     started = time.monotonic()
@@ -748,6 +832,23 @@ def listen_forever():
                 # re-broadcast a state the screen is showing.
             else:
                 score = oww.predict(frame).get(label, 0.0)
+
+                # An armed capture keeps buffering past the trigger, tracking the
+                # peak so the clip is filed under the best score the model gave
+                # rather than the first one over the line.
+                if pending:
+                    peak = max(peak, score)
+                    pending -= 1
+                    if not pending:
+                        # list() runs here, on this thread, before the worker
+                        # exists — so the snapshot cannot be torn by the appends
+                        # that follow it. read_frame allocates a fresh array per
+                        # call, so nothing already in it is mutated either.
+                        threading.Thread(target=save_near_miss,
+                                         args=(list(history), peak),
+                                         daemon=True).start()
+                        last_capture = time.monotonic()
+
                 if score < DETECTION_THRESHOLD:
                     # A miss is otherwise invisible, which makes "it only hears
                     # one tone" impossible to act on: a 0.45 means the threshold
@@ -757,11 +858,24 @@ def listen_forever():
                     if score >= NEAR_MISS_SCORE and time.monotonic() - last_near_miss > 1.0:
                         last_near_miss = time.monotonic()
                         log(f"near miss: {score:.3f}")
+                        # Arming is gated separately, and more slowly: a journal
+                        # line costs nothing, two seconds of audio costs a file.
+                        # Measured from the last dump, so consecutive clips are a
+                        # full buffer apart and cannot share a sample.
+                        if (not pending
+                                and time.monotonic() - last_capture >= NEAR_MISS_COOLDOWN_SEC):
+                            pending, peak = NEAR_MISS_TAIL_FRAMES, score
                     continue
                 if time.monotonic() - last_fire < COOLDOWN_SEC:
                     continue
 
                 last_fire = time.monotonic()
+                # A real hit mid-capture is not a near miss. Drop the armed clip:
+                # the question recording about to run covers this audio anyway,
+                # and a "miss" the model actually caught would go into the
+                # training set mislabelled, which is the one thing this whole
+                # pipeline must not produce.
+                pending = 0
                 log(f"wake word detected, confidence: {score:.3f}")
 
                 # Fire-and-forget so a slow Railway round trip does not eat the
@@ -780,6 +894,10 @@ def listen_forever():
             # Clear the model's internal audio buffer, otherwise the wake word
             # still sitting in it re-fires the moment we resume.
             preroll.clear()
+            # record() read frames straight off the pipe without passing them
+            # through here, so what is left is from before the question — two
+            # seconds either side of a gap that is now several seconds wide.
+            history.clear()
             oww.reset()
 
             # Recording and saving consumed frames this counter never saw, so
@@ -1025,6 +1143,51 @@ def selftest():
         assert played == []
     finally:
         globals()["REMINDER_FILE"], globals()["SPEECH_URL"], globals()["_play"] = _real
+
+    # Near-miss clips become positive training data for the next model, so a
+    # clip that is silent, truncated or quietly overwritten is worse than no
+    # clip at all — it gets reviewed by ear and folded in on trust.
+    #
+    # The centring is the part most likely to break silently: a tail as long as
+    # the buffer means every clip ends exactly at the trigger and contains only
+    # the run-up, which sounds like a clipped word and would be discarded by
+    # hand one at a time forever.
+    assert NEAR_MISS_TAIL_FRAMES < NEAR_MISS_FRAMES, \
+        "tail outruns the buffer — clips would end before the trigger"
+    # Two clips must never share audio, or the same utterance is folded in twice
+    # and weighted double. Measured from the dump, which is TAIL after the arm.
+    assert NEAR_MISS_COOLDOWN_SEC >= NEAR_MISS_SEC, \
+        "capture cooldown shorter than the buffer — consecutive clips overlap"
+
+    _real_dir, _real_keep = NEAR_MISS_DIR, NEAR_MISS_KEEP
+    globals()["NEAR_MISS_DIR"] = Path(tempfile.mkdtemp()) / "near-misses"
+    globals()["NEAR_MISS_KEEP"] = 3
+    try:
+        NEAR_MISS_DIR.mkdir(parents=True)
+        # Reviewed clips live in a subdirectory and the cap must not reach them.
+        (NEAR_MISS_DIR / "verified").mkdir()
+        keeper = NEAR_MISS_DIR / "verified" / "20200101_000000_0.900.wav"
+        keeper.write_bytes(b"kept")
+        for n in range(5):
+            (NEAR_MISS_DIR / f"20200101_00000{n}_0.200.wav").write_bytes(b"old")
+
+        save_near_miss([speech, speech], 0.234)
+        left = sorted(p.name for p in NEAR_MISS_DIR.glob("*.wav"))
+        assert len(left) == NEAR_MISS_KEEP, left
+        assert keeper.exists(), "the cap deleted a reviewed clip"
+        # Newest survives and the oldest go, or the cap throws away the misses
+        # worth looking at and keeps last month's.
+        assert left[-1].endswith("_0.234.wav"), left
+        assert not any(n.startswith("20200101_000000") for n in left), left
+
+        with wave.open(str(NEAR_MISS_DIR / left[-1])) as w:
+            assert w.getnchannels() == 1 and w.getsampwidth() == 2
+            assert w.getframerate() == SAMPLE_RATE, w.getframerate()
+            clip = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        assert len(clip) == 2 * FRAME_SAMPLES, len(clip)
+        assert rms(clip) > 0, "wrote a silent clip"
+    finally:
+        globals()["NEAR_MISS_DIR"], globals()["NEAR_MISS_KEEP"] = _real_dir, _real_keep
 
     assert Path(find_model()).exists()
 

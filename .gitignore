@@ -10,3 +10,8 @@ __pycache__/
 # Runtime output / local media
 media/
 out_*.png
+
+# Captured audio. Written on the Pi at a few MB a day and never wanted in the
+# history — `git add -A` up there would otherwise commit 27 MB of questions.
+# Near-miss clips live in ~/wakeword-near-misses, outside this tree entirely.
+voice/recordings/

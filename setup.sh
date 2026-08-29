@@ -13,7 +13,7 @@ fi
 
 echo "[setup] Installing system packages..."
 apt-get update -qq
-apt-get install -y -qq python3 python3-venv python3-pip git
+apt-get install -y -qq python3 python3-venv python3-pip python3-dev git swig liblgpio-dev
 
 echo "[setup] Creating Python venv..."
 if [ ! -d "$VENV" ]; then
@@ -33,10 +33,11 @@ chmod +x "$REPO_DIR/deploy.sh" "$REPO_DIR/watch-deploy.sh"
 echo "[setup] Installing systemd services..."
 cp "$REPO_DIR/desky.service" /etc/systemd/system/desky.service
 cp "$REPO_DIR/desky-watch.service" /etc/systemd/system/desky-watch.service
+cp "$REPO_DIR/desky-voice.service" /etc/systemd/system/desky-voice.service
 
 systemctl daemon-reload
-systemctl enable desky desky-watch
-systemctl start desky desky-watch
+systemctl enable desky desky-watch desky-voice
+systemctl start desky desky-watch desky-voice
 
 echo "[setup] Done. Services running:"
-systemctl --no-pager status desky desky-watch || true
+systemctl --no-pager status desky desky-watch desky-voice || true
