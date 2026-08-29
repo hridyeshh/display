@@ -52,15 +52,28 @@ WIZ_PORT = 38899
 # a Pi with no bulb on its network still answers questions.
 BULB_IP = os.environ.get("DESKY_BULB_IP", "")
 
-# How long to wait for the bulb to confirm.
+# How long to wait for the bulb to confirm one attempt.
 #
 # This timeout is the only reason we know anything at all: UDP sendto() reports
 # success once the packet leaves, so a bulb that is unplugged, asleep, on
 # another subnet, or simply at a different address than we think all look
-# exactly like a bulb that obeyed. The reply is the evidence. 2s is generous for
-# a LAN round trip (single-digit ms in practice) and short enough that the
-# spoken confirmation does not lag noticeably behind the question.
-REPLY_TIMEOUT_SEC = 2.0
+# exactly like a bulb that obeyed. The reply is the evidence.
+#
+# 0.7s per try, not one 2s wait. Measured RTT to the bulb is 120-170 ms — two
+# orders off a wired LAN, because a WiZ bulb runs its radio in power save and
+# parks between beacons. Waiting longer does not help; asking again does.
+REPLY_TIMEOUT_SEC = 0.7
+
+# The bulb drops the first packet after an idle spell while its radio wakes, and
+# nothing retransmits it — UDP has no such thing and setPilot is not TCP. That
+# made "turn on the light" fail roughly at random and say the bulb was offline
+# while it sat there answering pings.
+#
+# Safe to repeat because setPilot is absolute, not relative: the same params
+# arriving twice set the same state. A duplicate is a no-op, a lost packet is a
+# lie, so this errs toward the duplicate. Total budget still 2.1s, which keeps
+# the spoken confirmation as prompt as the single-shot version was.
+SEND_ATTEMPTS = 3
 
 # The setPilot arguments this end will forward, all integers. Anything outside
 # this set is refused rather than passed on: the backend builds params from a
@@ -93,21 +106,29 @@ def set_pilot(params, ip=None, timeout=REPLY_TIMEOUT_SEC):
         return False, "DESKY_BULB_IP is not set", "The light isn't set up yet."
 
     payload = json.dumps({"method": "setPilot", "params": params}).encode()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
-    try:
-        sock.sendto(payload, (ip, WIZ_PORT))
-        raw, _ = sock.recvfrom(1024)
-    except socket.timeout:
+    raw = None
+    for _ in range(SEND_ATTEMPTS):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        try:
+            sock.sendto(payload, (ip, WIZ_PORT))
+            raw, _addr = sock.recvfrom(1024)
+            break
+        except socket.timeout:
+            continue
+        except OSError as e:
+            # Bad address, no route, network down: all arrive here, all worth
+            # quoting as themselves because the fix differs for each. None of
+            # them clear up in 0.7s, so these do not get a second try — retrying
+            # a bad address just makes the failure take three times as long.
+            return False, f"udp send to {ip} failed: {e}", SPOKEN_UNREACHABLE
+        finally:
+            sock.close()
+    if raw is None:
         return (False,
-                f"no reply from {ip} in {timeout:g}s — bulb offline or wrong IP",
+                f"no reply from {ip} after {SEND_ATTEMPTS} tries of {timeout:g}s"
+                " — bulb offline or wrong IP",
                 SPOKEN_UNREACHABLE)
-    except OSError as e:
-        # Bad address, no route, network down: all arrive here, all worth quoting
-        # as themselves because the fix differs for each.
-        return False, f"udp send to {ip} failed: {e}", SPOKEN_UNREACHABLE
-    finally:
-        sock.close()
 
     # The bulb answers {"method":"setPilot","result":{"success":true}}. A reply
     # that parses but does not say success means the bulb rejected the params,
@@ -249,6 +270,51 @@ def _selftest():
         assert len(sent) == before, "a refused action still reached the bulb"
     finally:
         set_pilot = real
+
+    # A bulb that sleeps through the first packet must not read as a bulb that
+    # is gone. This is the flake the retry exists for, and without a check it
+    # regresses into an intermittent "I can\'t reach the light" that nobody can
+    # reproduce on demand.
+    def flaky_socket(silent_sends):
+        """A socket that times out for the first `silent_sends` sends."""
+        class S:
+            sends = 0
+
+            def __init__(self, *a):
+                pass
+
+            def settimeout(self, t):
+                pass
+
+            def close(self):
+                pass
+
+            def sendto(self, payload, addr):
+                S.sends += 1
+
+            def recvfrom(self, n):
+                if S.sends <= silent_sends:
+                    raise socket.timeout()
+                return (b'{"method":"setPilot","result":{"success":true}}',
+                        ("1.2.3.4", WIZ_PORT))
+        return S
+
+    real_socket = socket.socket
+    try:
+        # Asleep for every try but the last: still a success, and it took every
+        # attempt to get there.
+        socket.socket = late = flaky_socket(SEND_ATTEMPTS - 1)
+        ok, reason, spoken = set_pilot({"state": True}, ip="1.2.3.4")
+        assert ok, f"gave up on a bulb that answered on try {SEND_ATTEMPTS}: {reason}"
+        assert late.sends == SEND_ATTEMPTS, late.sends
+
+        # Genuinely gone: bounded, and still says so out loud.
+        socket.socket = never = flaky_socket(SEND_ATTEMPTS + 10)
+        ok, reason, spoken = set_pilot({"state": True}, ip="1.2.3.4")
+        assert not ok and spoken == SPOKEN_UNREACHABLE, (reason, spoken)
+        assert never.sends == SEND_ATTEMPTS, f"retried {never.sends} times, not {SEND_ATTEMPTS}"
+    finally:
+        socket.socket = real_socket
 
     # A missing IP has to fail rather than broadcast, and name the knob to turn.
     ok, reason, spoken = set_pilot({"state": True}, ip="")

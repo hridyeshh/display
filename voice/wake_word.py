@@ -17,6 +17,7 @@ import wave
 import glob
 import threading
 import subprocess
+import tempfile
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -235,12 +236,38 @@ def open_mic():
     their native one (48000/44100) — and openWakeWord needs exactly 16 kHz.
     arecord's plug layer resamples for us, which is also one less dependency.
     """
-    return subprocess.Popen(
+    # arecord's stderr is kept, not discarded: when it exits, the line it wrote
+    # IS the diagnosis. "No such file or directory" means the udev-pinned name
+    # is gone, "Device or resource busy" means something else holds the mic,
+    # "Invalid argument" means the format was refused — three different repairs
+    # that all look identical once the message is dropped.
+    #
+    # A temp file rather than a PIPE. Nothing reads this until the process is
+    # already dead, and an unread pipe that fills would block arecord itself —
+    # trading a silent failure for a wedged one.
+    err = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
         ["arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", str(SAMPLE_RATE),
          "-c", "1", "-t", "raw", "-q", "-"],
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=err,
     )
+    proc.mic_stderr = err
+    return proc
+
+
+def mic_error(proc):
+    """What arecord complained about before dying, or "" if it was silent."""
+    err = getattr(proc, "mic_stderr", None)
+    if err is None:
+        return ""
+    try:
+        err.seek(0)
+        return err.read().decode(errors="replace").strip().replace("\n", " | ")
+    except (OSError, ValueError):
+        # A closed or unseekable file is not worth losing the exit over — the
+        # caller is already on its way out with a less specific message.
+        return ""
 
 
 def read_frame(proc):
@@ -794,7 +821,9 @@ def listen_forever():
             if frame is None:
                 # arecord exited — mic pulled, or the device is busy. Die and
                 # let systemd's Restart=always retry until it comes back.
-                raise SystemExit(f"arecord stopped on {MIC_DEVICE}")
+                raise SystemExit(
+                    f"arecord stopped on {MIC_DEVICE}: "
+                    f"{mic_error(proc) or 'no error output'}")
             preroll.append(frame)
             history.append(frame)
 
@@ -917,7 +946,9 @@ def calibrate(seconds=10):
         for _ in range(int(seconds / FRAME_SEC)):
             frame = read_frame(proc)
             if frame is None:
-                raise SystemExit(f"arecord stopped on {MIC_DEVICE}")
+                raise SystemExit(
+                    f"arecord stopped on {MIC_DEVICE}: "
+                    f"{mic_error(proc) or 'no error output'}")
             v = rms(frame)
             (loud if v > SILENCE_RMS else quiet).append(v)
             print(f"  rms {v:8.1f}", flush=True)
