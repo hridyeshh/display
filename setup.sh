@@ -27,6 +27,14 @@ fi
 # arg wake_word.py passes and defaults to that same missing backend.
 "$VENV/bin/pip" install --quiet --no-deps openwakeword==0.6.0
 
+# The wheel ships no weights. melspectrogram.onnx and embedding_model.onnx are
+# the shared frontend every wake model runs through, including our own
+# hey_desky.onnx, and without them Model() dies on NO_SUCHFILE. Idempotent —
+# it skips whatever is already on disk. Before the chown so root-written files
+# get handed back with the rest of the venv.
+echo "[setup] Fetching openWakeWord feature models..."
+"$VENV/bin/python" -c "import openwakeword.utils as u; u.download_models()"
+
 # This script runs under sudo, so everything above is root-owned. Hand the venv
 # back to whoever owns the repo, or the next `pip install` from a normal shell
 # dies on EACCES halfway through unpacking a wheel.
