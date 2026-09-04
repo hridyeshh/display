@@ -14,6 +14,11 @@ User=hridyesh
 # Without this, systemd buffers stdout and journalctl shows nothing until the
 # process dies — useless for watching detections live.
 Environment=PYTHONUNBUFFERED=1
+# Host-local settings that are not in git and must survive a setup.sh re-run:
+# DESKY_BULB_IP above all, which is a fact about this house's LAN, not about the
+# code. The leading '-' makes the file optional, so a Pi without one still boots.
+# setup.sh creates it once and never overwrites it.
+EnvironmentFile=-/etc/desky.env
 # The mic is only reachable through the audio group.
 SupplementaryGroups=audio
 

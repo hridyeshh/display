@@ -10,6 +10,11 @@ Restart=always
 RestartSec=5
 User=hridyesh
 Environment=PYTHONUNBUFFERED=1
+# Host-local settings that are not in git and must survive a setup.sh re-run:
+# DESKY_BULB_IP above all, which is a fact about this house's LAN, not about the
+# code. The leading '-' makes the file optional, so a Pi without one still boots.
+# setup.sh creates it once and never overwrites it.
+EnvironmentFile=-/etc/desky.env
 
 [Install]
 WantedBy=multi-user.target

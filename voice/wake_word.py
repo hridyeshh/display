@@ -136,6 +136,18 @@ ERROR_URL = BACKEND + "/voice/error"
 # MIC_DEVICE above for why numbers are not stable here.
 SPEAKER_DEVICE = os.environ.get("DESKY_SPEAKER_DEVICE", "plughw:speaker,0")
 
+# Multiplier applied to everything on its way to the speaker: the ring, the
+# spoken answers, the reminders.
+#
+# Off by default, and the mixer is the knob to turn first — setup.sh puts the
+# adapter's own playback control at 100%, and analog headroom costs nothing
+# while this cannot add any. What is left after that is a small speaker on the
+# end of a Pi and a 42s tune whose loud parts already peak at -3.9 dBFS, so
+# gain here buys volume by clipping the peaks flat. 1.5 is inaudible as
+# distortion on a ring and plainly louder; past 2.5 the tune starts to rasp.
+# Set it in /etc/desky.env, which survives a setup.sh re-run.
+SPEAKER_GAIN = float(os.environ.get("DESKY_VOLUME", "1.0"))
+
 # --- fixed by openWakeWord ------------------------------------------------
 # The melspectrogram frontend assumes 16 kHz mono int16 in 80 ms frames.
 SAMPLE_RATE = 16000
@@ -431,6 +443,44 @@ def send_audio(path):
         speak(answer)
 
 
+def amplify(wav):
+    """Scale a 16-bit PCM WAV by SPEAKER_GAIN, clipping rather than wrapping.
+
+    Clipping, not wrapping: numpy's int16 arithmetic overflows silently, and a
+    loud sample that wraps to a loud *negative* one is a click on every peak —
+    which is exactly where an alarm spends its time.
+
+    Returns the buffer untouched at gain 1.0, so the default path does no work
+    and callers that cache their audio keep caching the same object.
+    """
+    if SPEAKER_GAIN == 1.0:
+        return wav
+    try:
+        with wave.open(io.BytesIO(wav)) as r:
+            channels, width, rate = r.getnchannels(), r.getsampwidth(), r.getframerate()
+            frames = r.readframes(r.getnframes())
+        if width != 2:
+            # Groq returns 16-bit today; anything else is left alone rather than
+            # mangled, because a wrong sample width is silence, not quiet audio.
+            log(f"not amplifying: {width * 8}-bit audio")
+            return wav
+        samples = np.frombuffer(frames, dtype=np.int16) * SPEAKER_GAIN
+        louder = np.clip(samples, -32768, 32767).astype(np.int16)
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(channels)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(louder.tobytes())
+        return buf.getvalue()
+    except Exception as e:
+        # A ring that plays quiet beats a ring that does not play. Every caller
+        # here is one where silence is the worst outcome.
+        log(f"amplify failed ({e}) — playing at source level")
+        return wav
+
+
 def _play(wav):
     """Push a complete WAV at the speaker. Returns whether it played.
 
@@ -440,7 +490,7 @@ def _play(wav):
     than the sound.
     """
     p = subprocess.run(["aplay", "-D", SPEAKER_DEVICE, "-q", "-"],
-                       input=wav, stderr=subprocess.PIPE)
+                       input=amplify(wav), stderr=subprocess.PIPE)
     if p.returncode != 0:
         log(f"aplay failed: {p.stderr.decode(errors='replace')[:160]}")
         return False
@@ -551,11 +601,13 @@ def alarm_audio():
     global _TUNE
     if _TUNE is None:
         try:
-            _TUNE = ALARM_TUNE.read_bytes()
+            # Amplified here rather than in play_alarm, so the 1.8 MB is scaled
+            # once at the first ring and not again between every repeat.
+            _TUNE = amplify(ALARM_TUNE.read_bytes())
             log(f"alarm tune: {len(_TUNE)} bytes from {ALARM_TUNE.name}")
         except Exception as e:
             log(f"no alarm tune ({e}) — falling back to the beep")
-            _TUNE = beep_wav()
+            _TUNE = amplify(beep_wav())
     return _TUNE
 
 
@@ -963,7 +1015,7 @@ def calibrate(seconds=10):
 
 def selftest():
     """Runs without a mic, so it works on the dev machine too."""
-    global MIC_GAIN  # the clip check below forces it on; restored in a finally
+    global MIC_GAIN, SPEAKER_GAIN  # both are forced on below; restored in a finally
 
     quiet = np.zeros(FRAME_SAMPLES, dtype=np.int16)
     loud = np.full(FRAME_SAMPLES, 3000, dtype=np.int16)
@@ -1074,6 +1126,30 @@ def selftest():
     # Pulsed, not continuous: there must be silence in there somewhere.
     assert (beep == 0).any(), "beep is a solid tone, not bursts"
     assert beep_wav() is raw, "beep rebuilt instead of being cached"
+
+    # Turning the volume up must make it louder without wrapping the peaks
+    # negative — the one failure mode that turns a ring into a buzz, and the one
+    # nobody hears until 6am.
+    _real_gain = SPEAKER_GAIN
+    try:
+        SPEAKER_GAIN = 1.0
+        assert amplify(raw) is raw, "gain 1.0 copied the buffer for nothing"
+
+        SPEAKER_GAIN = 8.0
+        with wave.open(io.BytesIO(amplify(raw))) as w:
+            assert w.getframerate() == SAMPLE_RATE and w.getnchannels() == 1
+            loud = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
+        assert len(loud) == len(beep), "amplify changed the length"
+        assert rms(loud) > rms(beep), f"gain made it quieter: {rms(loud):.0f}"
+        # 8x on a beep that peaks at 8000 saturates, which is the point: it has
+        # to flatten at the rail rather than come out the other side.
+        assert loud.max() == 32767 and loud.min() == -32768, (loud.min(), loud.max())
+        # Every sample keeps the sign it started with. A wrap shows up here.
+        assert (np.sign(loud) == np.sign(beep)).all(), "a sample wrapped"
+
+        assert amplify(b"not a wav") == b"not a wav", "a bad buffer was not passed through"
+    finally:
+        SPEAKER_GAIN = _real_gain
 
     # The tune has to be a WAV aplay will actually take. A conversion that quietly
     # produced something else — or an mp3 renamed .wav — fails at exactly one

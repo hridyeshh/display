@@ -1,0 +1,23 @@
+# Pin stable ALSA card names for the two USB audio devices.
+#
+# wake_word.py opens plughw:mic,0 and plughw:speaker,0 by *name*, never by
+# index, because indexes move: the Pi Zero 2W has one USB port, everything hangs
+# off a bus-powered hub, and the hub re-enumerates in arbitrary order after a
+# replug or a brownout. This mic has been card 1 and card 2 on different boots.
+#
+# This file is why those names exist. It was hand-written on the Pi once and
+# lived nowhere else, so the re-setup wiped it and both the wake word and the
+# speaker died at the same instant with "Cannot get card index for mic" —
+# 3297 crash-restarts before anyone connected the two symptoms. It is in the
+# repo now, and setup.sh installs it.
+#
+# KERNEL=="card?*" because only the card device carries a writable id attribute;
+# the sound subsystem also emits controlC0, pcmC0D0c and friends, and an
+# ATTR{id} assignment on those is a silent no-op.
+
+# C-Media / TI PCM2902 USB PnP Sound Device. Capture only; this is the mic.
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="card?*", ATTRS{idVendor}=="08bb", ATTRS{idProduct}=="2902", ATTR{id}="mic"
+
+# AB13X USB headset adapter. The only USB card with a playback device, so this
+# is what Desky talks out of.
+ACTION=="add", SUBSYSTEM=="sound", KERNEL=="card?*", ATTRS{idVendor}=="001f", ATTRS{idProduct}=="0b21", ATTR{id}="speaker"
