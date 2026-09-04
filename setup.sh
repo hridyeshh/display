@@ -175,9 +175,21 @@ systemctl start desky desky-watch desky-voice
 echo "[setup] Done. Services running:"
 systemctl --no-pager status desky desky-watch desky-voice || true
 
-# The services were started seconds ago; give a crash-on-import time to show up
-# before asking systemd whether they are running.
-sleep 5
+# `systemctl is-active` on its own is not enough to say a service is healthy:
+# every unit here has Restart=always, so a service crash-looping on startup is
+# reported active during each of its up windows. desky-voice did exactly that on
+# a run where the udev trigger below had not finished re-registering the sound
+# cards — nine green checks over a wake word that was dying every 25 seconds.
+# Snapshot the restart counters now, let the services run, and compare after: a
+# counter that moved across the window is a loop, whatever is-active says.
+declare -A RESTARTS_BEFORE
+for svc in desky desky-watch desky-voice; do
+  RESTARTS_BEFORE[$svc]="$(systemctl show "$svc" -p NRestarts --value)"
+done
+
+# Long enough to span a restart cycle: the units back off ~5s and desky-voice
+# needs ~18s to load the wake model before it can fail on the mic.
+sleep 30
 
 echo
 echo "[setup] ===== Verification ====="
@@ -207,8 +219,13 @@ check "wlan0 WiFi powersave off" powersave_off
 THROTTLED="$(vcgencmd get_throttled 2>/dev/null || echo unavailable)"
 check "vcgencmd get_throttled is 0x0 (got: $THROTTLED)" test "$THROTTLED" = "throttled=0x0"
 
+svc_healthy() {
+  local svc="$1"
+  systemctl is-active --quiet "$svc" || return 1
+  [ "$(systemctl show "$svc" -p NRestarts --value)" = "${RESTARTS_BEFORE[$svc]}" ]
+}
 for svc in desky desky-watch desky-voice; do
-  check "$svc service active" systemctl is-active --quiet "$svc"
+  check "$svc service active and not restarting" svc_healthy "$svc"
 done
 
 # pip has died mid-install on pillow with an IncompleteRead more than once here.
